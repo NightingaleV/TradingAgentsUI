@@ -117,14 +117,35 @@ pip install .
 
 ### Docker
 
-Alternatively, run with Docker:
+Run the durable Reflex research console and its isolated single-concurrency worker:
+
 ```bash
-cp .env.example .env  # add your API keys
-docker compose run --rm tradingagents
+cp .env.example .env  # add the key for your selected provider
+docker compose up --build -d web worker
 ```
 
-For local models with Ollama:
+Open `http://localhost:8501`. Provider, endpoint, and quick/deep model choices are
+persisted in SQLite under the shared `tradingagents_data` volume. Runs continue in
+the worker after the browser closes, and completed reports, checkpoints, memory,
+diagnostics, and settings survive container recreation. The Settings page can also
+store credentials in a write-only, mode-`0600` file inside that volume.
+
+For access through a private-network hostname or authenticated TLS reverse proxy,
+set `REFLEX_API_URL` and `REFLEX_DEPLOY_URL` in `.env` to that public origin. The
+default port bind is loopback-only; this console is intended for one trusted operator.
+
+The interactive CLI remains available against the same persistent volume:
+
 ```bash
+docker compose --profile cli run --rm tradingagents
+```
+
+For local models with Ollama, start the server, web app, and worker with the internal
+service endpoint, then pull a model with the Ollama CLI:
+
+```bash
+OLLAMA_BASE_URL=http://ollama:11434/v1 docker compose --profile ollama up --build -d ollama web worker
+docker compose exec ollama ollama pull qwen3:latest
 docker compose --profile ollama run --rm tradingagents-ollama
 ```
 

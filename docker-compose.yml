@@ -1,12 +1,51 @@
+x-tradingagents-common: &tradingagents-common
+  build:
+    context: .
+  env_file:
+    - .env
+  environment:
+    TRADINGAGENTS_HOME: /home/appuser/.tradingagents
+    OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434/v1}
+  volumes:
+    - tradingagents_data:/home/appuser/.tradingagents
+
 services:
+  web:
+    <<: *tradingagents-common
+    command:
+      - reflex
+      - run
+      - --env
+      - prod
+      - --single-port
+      - --frontend-port
+      - "8501"
+      - --backend-port
+      - "8501"
+    ports:
+      - "${TRADINGAGENTS_WEB_BIND:-127.0.0.1}:8501:8501"
+    depends_on:
+      worker:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_health', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    <<: *tradingagents-common
+    command: ["python", "-m", "tradingagents.runtime.worker"]
+    restart: unless-stopped
+
   tradingagents:
-    build: .
-    env_file:
-      - .env
-    volumes:
-      - tradingagents_data:/home/appuser/.tradingagents
+    <<: *tradingagents-common
     tty: true
     stdin_open: true
+    profiles:
+      - cli
 
   ollama:
     image: ollama/ollama:latest
@@ -14,16 +53,14 @@ services:
       - ollama_data:/root/.ollama
     profiles:
       - ollama
+    restart: unless-stopped
 
   tradingagents-ollama:
-    build: .
-    env_file:
-      - .env
+    <<: *tradingagents-common
     environment:
-      - TRADINGAGENTS_LLM_PROVIDER=ollama
-      - OLLAMA_BASE_URL=http://ollama:11434/v1
-    volumes:
-      - tradingagents_data:/home/appuser/.tradingagents
+      TRADINGAGENTS_HOME: /home/appuser/.tradingagents
+      TRADINGAGENTS_LLM_PROVIDER: ollama
+      OLLAMA_BASE_URL: http://ollama:11434/v1
     depends_on:
       - ollama
     tty: true

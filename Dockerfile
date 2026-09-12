@@ -1,28 +1,25 @@
-FROM python:3.12-slim AS builder
+FROM node:22.22.0-bookworm-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PATH="/opt/venv/bin:$PATH"
 
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv python3-pip build-essential curl git \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 -m venv /opt/venv
 
-WORKDIR /build
+WORKDIR /app
 COPY . .
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[web,bedrock]" \
+ && reflex compile --no-rich \
+ && useradd --create-home --uid 10001 appuser \
+ && install -d -m 0755 -o appuser -g appuser /home/appuser/.tradingagents \
+ && chown -R appuser:appuser /app
 
-FROM python:3.12-slim
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-RUN useradd --create-home appuser \
- && install -d -m 0755 -o appuser -g appuser /home/appuser/.tradingagents
 USER appuser
-WORKDIR /home/appuser/app
+EXPOSE 8501
 
-COPY --from=builder --chown=appuser:appuser /build .
-
-ENTRYPOINT ["tradingagents"]
+CMD ["tradingagents"]

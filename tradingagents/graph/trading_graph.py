@@ -323,7 +323,7 @@ class TradingAgentsGraph:
             )
             return None, None, None, None
 
-    def _resolve_pending_entries(self, ticker: str) -> None:
+    def resolve_pending_entries(self, ticker: str) -> None:
         """Resolve pending log entries for ticker at the start of a new run.
 
         Fetches returns for each same-ticker pending entry, generates reflections,
@@ -364,6 +364,10 @@ class TradingAgentsGraph:
         if updates:
             self.memory_log.batch_update_with_outcomes(updates)
 
+    # Backward-compatible aliases for callers predating the public runtime API.
+    def _resolve_pending_entries(self, ticker: str) -> None:
+        self.resolve_pending_entries(ticker)
+
     def resolve_instrument_context(self, ticker: str, asset_type: str = "stock") -> str:
         """Resolve ticker identity once and return the full instrument context.
 
@@ -376,7 +380,7 @@ class TradingAgentsGraph:
         identity = resolve_instrument_identity(ticker)
         return build_instrument_context(ticker, asset_type, identity)
 
-    def _memory_as_of(self, trade_date) -> str | None:
+    def memory_as_of(self, trade_date) -> str | None:
         """Point-in-time cutoff for past-context lessons (#1251).
 
         A historical/backtest run (trade date before today) filters lessons to
@@ -387,7 +391,10 @@ class TradingAgentsGraph:
         td = str(trade_date)
         return td if td < datetime.now().strftime("%Y-%m-%d") else None
 
-    def _run_signature(self, asset_type: str) -> str:
+    def _memory_as_of(self, trade_date) -> str | None:
+        return self.memory_as_of(trade_date)
+
+    def run_signature(self, asset_type: str) -> str:
         """Graph-shape inputs that must invalidate a checkpoint if changed.
 
         Keyed into the checkpoint thread ID so a resume under a different analyst
@@ -400,6 +407,9 @@ class TradingAgentsGraph:
             f"risk={self.config['max_risk_discuss_rounds']}",
             f"asset={asset_type}",
         ])
+
+    def _run_signature(self, asset_type: str) -> str:
+        return self.run_signature(asset_type)
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
         """Run the trading agents graph for a company on a specific date.
@@ -420,7 +430,7 @@ class TradingAgentsGraph:
         self.ticker = company_name
 
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
-        self._resolve_pending_entries(company_name)
+        self.resolve_pending_entries(company_name)
 
         with self.checkpoint_scope(company_name, trade_date, asset_type) as thread_id_value:
             return self._run_graph(
@@ -442,7 +452,7 @@ class TradingAgentsGraph:
         self._resuming = False
         if not self.config.get("checkpoint_enabled"):
             return None
-        signature = self._run_signature(asset_type)
+        signature = self.run_signature(asset_type)
         self._checkpointer_ctx = get_checkpointer(self.config["data_cache_dir"], company_name)
         saver = self._checkpointer_ctx.__enter__()
         self.graph = self.workflow.compile(checkpointer=saver)
@@ -467,6 +477,11 @@ class TradingAgentsGraph:
         """
         return None if self._resuming else init_state
 
+    @property
+    def resuming(self) -> bool:
+        """Whether the active checkpoint scope is resuming saved graph state."""
+        return self._resuming
+
     def end_checkpoint(self):
         """Restore the plain uncheckpointed graph after a checkpointed run."""
         if self._checkpointer_ctx is not None:
@@ -488,7 +503,7 @@ class TradingAgentsGraph:
         if self.config.get("checkpoint_enabled"):
             clear_checkpoint(
                 self.config["data_cache_dir"], company_name, str(trade_date),
-                self._run_signature(asset_type),
+                self.run_signature(asset_type),
             )
 
     def save_reports(self, final_state, ticker, save_path=None) -> Path:
@@ -514,7 +529,7 @@ class TradingAgentsGraph:
         # historical run, gate lessons to those whose outcome was known by the
         # trade date so a backtest can't learn from the future (#1251).
         past_context = self.memory_log.get_past_context(
-            company_name, as_of=self._memory_as_of(trade_date)
+            company_name, as_of=self.memory_as_of(trade_date)
         )
         instrument_context = self.resolve_instrument_context(company_name, asset_type)
         init_agent_state = self.propagator.create_initial_state(
@@ -559,7 +574,7 @@ class TradingAgentsGraph:
         self.curr_state = final_state
 
         # Log state to disk.
-        self._log_state(trade_date, final_state)
+        self.log_state(trade_date, final_state)
 
         # Store decision for deferred reflection on the next same-ticker run.
         self.memory_log.store_decision(
@@ -573,7 +588,7 @@ class TradingAgentsGraph:
 
         return final_state, self.process_signal(final_state["final_trade_decision"])
 
-    def _log_state(self, trade_date, final_state):
+    def log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""
         self.log_states_dict[str(trade_date)] = {
             "company_of_interest": final_state["company_of_interest"],
@@ -614,6 +629,9 @@ class TradingAgentsGraph:
         log_path = directory / f"full_states_log_{trade_date}.json"
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(self.log_states_dict[str(trade_date)], f, indent=4)
+
+    def _log_state(self, trade_date, final_state):
+        self.log_state(trade_date, final_state)
 
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""
