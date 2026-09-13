@@ -685,7 +685,7 @@ class AppState(rx.State):
                     "team": payload.get("team") or "Agent team",
                     "status": payload.get("status", "pending"),
                 }
-            if event["type"] in {"message", "tool_call", "run_status", "checkpoint", "error"}:
+            if event["type"] in {"message", "tool_call", "run_status", "checkpoint", "error", "agent_warning"}:
                 if event["type"] == "message":
                     summary = str(payload.get("content", ""))[:320]
                 elif event["type"] == "tool_call":

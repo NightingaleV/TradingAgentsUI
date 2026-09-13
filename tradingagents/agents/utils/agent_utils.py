@@ -43,6 +43,8 @@ __all__ = [
     "resolve_instrument_identity",
     "get_instrument_context_from_state",
     "get_language_instruction",
+    "invoke_agent_text",
+    "content_filter_warning",
     "create_msg_delete",
 ]
 
@@ -77,6 +79,71 @@ def opponent_argument_or_opening(text: str, opponent: str) -> str:
     if text:
         return text
     return f"(The {opponent} has not spoken yet — open the debate with your own case.)"
+
+
+def _is_content_filter_error(error: BaseException) -> bool:
+    """Return whether a provider rejected a completion for content policy.
+
+    Azure AI Foundry and Azure OpenAI surface this as a 400 with a
+    ``content_filter`` code.  Other OpenAI-compatible clients use the same
+    marker in a response exception or response metadata.  This deliberately
+    has a narrow match: connectivity, authentication, and ordinary model
+    failures must still stop the run instead of being hidden as a skipped turn.
+    """
+    text = str(error).lower()
+    return "content_filter" in text or "content filter" in text
+
+
+def _response_was_content_filtered(response: Any) -> bool:
+    """Recognise clients that return a filtered empty message without raising."""
+    metadata = getattr(response, "response_metadata", None)
+    if not isinstance(metadata, Mapping):
+        return False
+    finish_reason = str(metadata.get("finish_reason") or "").lower()
+    if finish_reason == "content_filter":
+        return True
+    return "content_filter" in str(metadata.get("content_filter_results") or "").lower()
+
+
+def invoke_agent_text(llm: Any, prompt: Any, agent_name: str) -> str | None:
+    """Invoke a non-terminal debate agent, skipping a policy-filtered turn.
+
+    ``None`` has one precise meaning: the provider filtered this completion.
+    Callers preserve all prior debate output, advance their turn counter, and
+    route to the next speaker.  Every other exception is re-raised so that a
+    real provider or application failure remains visible and recoverable.
+    """
+    try:
+        response = llm.invoke(prompt)
+    except Exception as exc:
+        if not _is_content_filter_error(exc):
+            raise
+        logger.warning(
+            "%s response was filtered by the model provider; skipping this turn",
+            agent_name,
+        )
+        return None
+
+    if _response_was_content_filtered(response):
+        logger.warning(
+            "%s response was filtered by the model provider; skipping this turn",
+            agent_name,
+        )
+        return None
+    content = getattr(response, "content", "")
+    return str(content).strip() if content is not None else ""
+
+
+def content_filter_warning(agent_name: str) -> dict[str, str]:
+    """A safe, user-visible event for a deliberately skipped agent turn."""
+    return {
+        "agent": agent_name,
+        "kind": "content_filter",
+        "message": (
+            f"{agent_name} was skipped because the model provider filtered its "
+            "response. Earlier output was retained and the pipeline continued."
+        ),
+    }
 
 
 def _clean_identity_value(value: Any) -> str | None:
@@ -226,6 +293,5 @@ def create_msg_delete():
         return {"messages": removal_operations + [placeholder]}
 
     return delete_messages
-
 
 

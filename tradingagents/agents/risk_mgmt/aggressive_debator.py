@@ -1,6 +1,8 @@
 from tradingagents.agents.utils.agent_utils import (
+    content_filter_warning,
     get_instrument_context_from_state,
     get_language_instruction,
+    invoke_agent_text,
     opponent_argument_or_opening,
 )
 
@@ -41,9 +43,28 @@ Here is the current conversation history: {history} Here are the last arguments 
 
 Engage actively by addressing any specific concerns raised, refuting the weaknesses in their logic, and asserting the benefits of risk-taking to outpace market norms. Maintain a focus on debating and persuading, not just presenting data. Challenge each counterpoint to underscore why a high-risk approach is optimal. Output conversationally as if you are speaking without any special formatting.""" + get_language_instruction()
 
-        response = llm.invoke(prompt)
+        response_content = invoke_agent_text(llm, prompt, "Aggressive Analyst")
+        if response_content is None:
+            skipped_turn = (
+                "[Aggressive Analyst skipped this turn because the model provider "
+                "filtered its response. Do not infer a risk preference from the omission.]"
+            )
+            return {
+                "risk_debate_state": {
+                    "history": history + "\n" + skipped_turn,
+                    "aggressive_history": aggressive_history,
+                    "conservative_history": risk_debate_state.get("conservative_history", ""),
+                    "neutral_history": risk_debate_state.get("neutral_history", ""),
+                    "latest_speaker": "Aggressive",
+                    "current_aggressive_response": skipped_turn,
+                    "current_conservative_response": risk_debate_state.get("current_conservative_response", ""),
+                    "current_neutral_response": risk_debate_state.get("current_neutral_response", ""),
+                    "count": risk_debate_state["count"] + 1,
+                },
+                "pipeline_warnings": [content_filter_warning("Aggressive Analyst")],
+            }
 
-        argument = f"Aggressive Analyst: {response.content}"
+        argument = f"Aggressive Analyst: {response_content}"
 
         new_risk_debate_state = {
             "history": history + "\n" + argument,

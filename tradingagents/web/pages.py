@@ -535,10 +535,11 @@ def agent_card(agent: rx.Var) -> rx.Component:
         agent["status"],
         ("completed", rx.icon("check", size=15)),
         ("running", rx.icon("loader-circle", size=15)),
+        ("skipped", rx.icon("forward", size=15)),
         ("failed", rx.icon("x", size=15)),
         rx.icon("clock", size=15),
     )
-    icon_class = rx.match(agent["status"], ("completed", "agent-icon complete"), ("running", "agent-icon running"), ("failed", "agent-icon failed"), "agent-icon")
+    icon_class = rx.match(agent["status"], ("completed", "agent-icon complete"), ("running", "agent-icon running"), ("skipped", "agent-icon skipped"), ("failed", "agent-icon failed"), "agent-icon")
     return rx.hstack(
         rx.center(icon, class_name=icon_class),
         rx.vstack(rx.text(agent["name"], size="2", weight="bold"), rx.text(agent["team"], size="1", color=MUTED), spacing="1", align="start"),

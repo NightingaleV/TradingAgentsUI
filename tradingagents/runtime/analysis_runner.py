@@ -114,6 +114,8 @@ class _Projection:
         self.report_content: dict[str, str] = {}
         self.message_ids: set[str] = set()
         self.debate_content: dict[str, str] = {}
+        self.warning_ids: set[tuple[str, str]] = set()
+        self.skipped_agents: set[str] = set()
         for analyst in request.analysts:
             self._status(ANALYST_REPORTS[analyst][0], "pending", "Analyst Team")
         for agent in FIXED_AGENTS:
@@ -126,6 +128,11 @@ class _Projection:
             self._status(agent, "pending", team)
 
     def _status(self, agent: str, status: str, team: str | None = None) -> None:
+        # A policy-filtered turn is a deliberate non-fatal skip.  Later graph
+        # snapshots still contain earlier agent output, so do not overwrite the
+        # explanatory status with "completed" while projecting those snapshots.
+        if agent in self.skipped_agents and status != "skipped":
+            return
         if self.statuses.get(agent) == status:
             return
         self.statuses[agent] = status
@@ -133,6 +140,38 @@ class _Projection:
             self.run_id,
             RunEvent("agent_status", {"display_name": agent, "team": team or "", "status": status}, agent),
         )
+
+    @staticmethod
+    def _team_for(agent: str) -> str:
+        if agent in FIXED_AGENTS[:3]:
+            return "Research Team"
+        if agent == "Trader":
+            return "Trading Team"
+        if agent in FIXED_AGENTS[4:7]:
+            return "Risk Management"
+        return "Portfolio Management"
+
+    def _warnings(self, chunk: dict[str, Any]) -> None:
+        for warning in chunk.get("pipeline_warnings", []) or []:
+            if not isinstance(warning, dict):
+                continue
+            agent = str(warning.get("agent") or "Agent")
+            kind = str(warning.get("kind") or "warning")
+            warning_id = (agent, kind)
+            if warning_id in self.warning_ids:
+                continue
+            self.warning_ids.add(warning_id)
+            if kind == "content_filter":
+                self.skipped_agents.add(agent)
+                self._status(agent, "skipped", self._team_for(agent))
+            self.sink.emit(
+                self.run_id,
+                RunEvent(
+                    "agent_warning",
+                    {"kind": kind, "message": str(warning.get("message") or "Agent warning")},
+                    agent,
+                ),
+            )
 
     def _report(self, key: str, content: str) -> None:
         content = content.strip()
@@ -172,6 +211,7 @@ class _Projection:
 
     def update(self, chunk: dict[str, Any], stats: dict[str, int]) -> None:
         self._messages(chunk)
+        self._warnings(chunk)
         now = time.monotonic()
         first_pending: str | None = None
         for analyst in self.request.analysts:

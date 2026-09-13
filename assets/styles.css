@@ -88,6 +88,7 @@ a { color: inherit; }
 .agent-icon { flex: 0 0 auto; width: 2rem; height: 2rem; border-radius: .62rem; color: #8090a5; background: #17212d; }
 .agent-icon.complete { color: #07110f; background: var(--ta-accent); }
 .agent-icon.running { color: #ddebff; background: #274b68; }
+.agent-icon.skipped { color: #ffe3a3; background: #5b4623; }
 .agent-icon.failed { color: #ffd3d3; background: #6c2d39; }
 .agent-icon.running svg { animation: ta-spin 1.25s linear infinite; }
 .decision-card { border-color: rgba(93,217,193,.3) !important; background: linear-gradient(145deg, rgba(23,63,58,.42), rgba(14,22,31,.96)) !important; }

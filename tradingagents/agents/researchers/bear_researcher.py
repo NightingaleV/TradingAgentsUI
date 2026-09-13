@@ -1,6 +1,8 @@
 from tradingagents.agents.utils.agent_utils import (
+    content_filter_warning,
     get_instrument_context_from_state,
     get_language_instruction,
+    invoke_agent_text,
     opponent_argument_or_opening,
 )
 
@@ -49,9 +51,25 @@ Last bull argument: {current_response}
 Use this information to deliver a compelling bear argument, refute the bull's claims, and engage in a dynamic debate that demonstrates the risks and weaknesses of investing in the {target_label}.
 """ + get_language_instruction()
 
-        response = llm.invoke(prompt)
+        response_content = invoke_agent_text(llm, prompt, "Bear Researcher")
+        if response_content is None:
+            skipped_turn = (
+                "[Bear Researcher skipped this turn because the model provider "
+                "filtered its response. Do not infer a bearish position from "
+                "the omission; evaluate the available evidence.]"
+            )
+            return {
+                "investment_debate_state": {
+                    "history": history + "\n" + skipped_turn,
+                    "bear_history": bear_history,
+                    "bull_history": investment_debate_state.get("bull_history", ""),
+                    "current_response": skipped_turn,
+                    "count": investment_debate_state["count"] + 1,
+                },
+                "pipeline_warnings": [content_filter_warning("Bear Researcher")],
+            }
 
-        argument = f"Bear Analyst: {response.content}"
+        argument = f"Bear Analyst: {response_content}"
 
         new_investment_debate_state = {
             "history": history + "\n" + argument,

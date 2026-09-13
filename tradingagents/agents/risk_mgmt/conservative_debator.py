@@ -1,6 +1,8 @@
 from tradingagents.agents.utils.agent_utils import (
+    content_filter_warning,
     get_instrument_context_from_state,
     get_language_instruction,
+    invoke_agent_text,
     opponent_argument_or_opening,
 )
 
@@ -41,9 +43,28 @@ Here is the current conversation history: {history} Here is the last response fr
 
 Engage by questioning their optimism and emphasizing the potential downsides they may have overlooked. Address each of their counterpoints to showcase why a conservative stance is ultimately the safest path for the firm's assets. Focus on debating and critiquing their arguments to demonstrate the strength of a low-risk strategy over their approaches. Output conversationally as if you are speaking without any special formatting.""" + get_language_instruction()
 
-        response = llm.invoke(prompt)
+        response_content = invoke_agent_text(llm, prompt, "Conservative Analyst")
+        if response_content is None:
+            skipped_turn = (
+                "[Conservative Analyst skipped this turn because the model provider "
+                "filtered its response. Do not infer a risk preference from the omission.]"
+            )
+            return {
+                "risk_debate_state": {
+                    "history": history + "\n" + skipped_turn,
+                    "aggressive_history": risk_debate_state.get("aggressive_history", ""),
+                    "conservative_history": conservative_history,
+                    "neutral_history": risk_debate_state.get("neutral_history", ""),
+                    "latest_speaker": "Conservative",
+                    "current_aggressive_response": risk_debate_state.get("current_aggressive_response", ""),
+                    "current_conservative_response": skipped_turn,
+                    "current_neutral_response": risk_debate_state.get("current_neutral_response", ""),
+                    "count": risk_debate_state["count"] + 1,
+                },
+                "pipeline_warnings": [content_filter_warning("Conservative Analyst")],
+            }
 
-        argument = f"Conservative Analyst: {response.content}"
+        argument = f"Conservative Analyst: {response_content}"
 
         new_risk_debate_state = {
             "history": history + "\n" + argument,
