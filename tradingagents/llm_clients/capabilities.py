@@ -98,13 +98,13 @@ _BY_ID: dict[str, ModelCapabilities] = {
     "deepseek-v4-pro": _DEEPSEEK_THINKING,
     # MiniMax — full official model lineup per
     # platform.minimax.io/docs/api-reference/text-openai-api
-    "MiniMax-M2.7": _MINIMAX_THINKING,
-    "MiniMax-M2.7-highspeed": _MINIMAX_THINKING,
-    "MiniMax-M2.5": _MINIMAX_THINKING,
-    "MiniMax-M2.5-highspeed": _MINIMAX_THINKING,
-    "MiniMax-M2.1": _MINIMAX_THINKING,
-    "MiniMax-M2.1-highspeed": _MINIMAX_THINKING,
-    "MiniMax-M2": _MINIMAX_THINKING,
+    "minimax-m2.7": _MINIMAX_THINKING,
+    "minimax-m2.7-highspeed": _MINIMAX_THINKING,
+    "minimax-m2.5": _MINIMAX_THINKING,
+    "minimax-m2.5-highspeed": _MINIMAX_THINKING,
+    "minimax-m2.1": _MINIMAX_THINKING,
+    "minimax-m2.1-highspeed": _MINIMAX_THINKING,
+    "minimax-m2": _MINIMAX_THINKING,
 }
 
 # Forward-compat patterns. New ``deepseek-v5-*`` / ``deepseek-reasoner-*``
@@ -112,12 +112,13 @@ _BY_ID: dict[str, ModelCapabilities] = {
 _BY_PATTERN: list[tuple[re.Pattern[str], ModelCapabilities]] = [
     (re.compile(r"^deepseek-v\d"), _DEEPSEEK_THINKING),
     (re.compile(r"^deepseek-reasoner"), _DEEPSEEK_THINKING),
-    (re.compile(r"^MiniMax-M\d"), _MINIMAX_THINKING),
+    (re.compile(r"^minimax-m\d"), _MINIMAX_THINKING),
 ]
 
 
 def get_capabilities(model_name: str) -> ModelCapabilities:
     """Resolve capabilities by exact ID, then pattern, then default."""
+    model_name = model_name.strip().lower()
     # OpenRouter namespaces official DeepSeek models as ``deepseek/<id>``, so
     # strip that prefix to reuse the same quirks as the native provider — e.g.
     # ``deepseek/deepseek-v4-flash`` must suppress tool_choice like

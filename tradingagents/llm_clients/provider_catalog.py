@@ -37,7 +37,7 @@ _PROVIDERS: tuple[ProviderMetadata, ...] = (
     ProviderMetadata("kimi", "Kimi · Moonshot", "https://api.moonshot.ai/v1", "MOONSHOT_API_KEY", True, custom_models_only=True),
     ProviderMetadata("groq", "Groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", True, custom_models_only=True),
     ProviderMetadata("nvidia", "NVIDIA NIM", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", True, custom_models_only=True),
-    ProviderMetadata("azure", "Azure OpenAI", None, "AZURE_OPENAI_API_KEY", True, custom_models_only=True),
+    ProviderMetadata("azure", "Azure AI Foundry / Azure OpenAI", None, "AZURE_OPENAI_API_KEY", True, custom_models_only=True),
     ProviderMetadata("bedrock", "Amazon Bedrock", None, None, False, custom_models_only=True),
     ProviderMetadata("ollama", "Ollama", os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"), None, False),
     ProviderMetadata("openai_compatible", "OpenAI-compatible endpoint", None, "OPENAI_COMPATIBLE_API_KEY", False, custom_models_only=True),

@@ -185,10 +185,23 @@ def new_analysis_page() -> rx.Component:
         ), "Sets both research and risk debate rounds; advanced fields can override."),
         spacing="4", align="start", width="100%",
     )
+    endpoint_field = rx.cond(
+        AppState.llm_provider == "azure",
+        field(
+            "Azure endpoint",
+            rx.input(value=AppState.backend_url, on_change=AppState.set_backend_url, placeholder="https://resource.openai.azure.com/openai/v1/", width="100%"),
+            "Foundry Models: use the full /openai/v1/ URL. Legacy Azure OpenAI deployments: use the resource root instead.",
+        ),
+        field(
+            "Resolved endpoint",
+            rx.input(value=AppState.backend_url, on_change=AppState.set_backend_url, placeholder="Provider default", width="100%"),
+            "Resolved by the worker, never by browser JavaScript.",
+        ),
+    )
     models = rx.vstack(
         rx.grid(
             field("Provider / region", rx.select(AppState.provider_options, value=AppState.provider_label, on_change=AppState.set_provider, width="100%"), "Saved immediately as the next-run default."),
-            field("Resolved endpoint", rx.input(value=AppState.backend_url, on_change=AppState.set_backend_url, placeholder="Provider default", width="100%"), "Resolved by the worker, never by browser JavaScript."),
+            endpoint_field,
             field("Quick model", rx.select(AppState.quick_model_options, value=AppState.quick_model_label, on_change=AppState.set_quick_model_choice, width="100%")),
             field("Deep model", rx.select(AppState.deep_model_options, value=AppState.deep_model_label, on_change=AppState.set_deep_model_choice, width="100%")),
             columns=rx.breakpoints(initial="1", md="2"), spacing="4", width="100%",
