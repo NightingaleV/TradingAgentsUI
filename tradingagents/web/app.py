@@ -4,6 +4,7 @@ import reflex as rx
 
 from .pages import (
     dashboard_page,
+    evaluation_page,
     memory_page,
     new_analysis_page,
     portfolio_page,
@@ -54,6 +55,12 @@ app.add_page(
     route="/memory",
     title="Decision memory · TradingAgents",
     on_load=AppState.load_memory,
+)
+app.add_page(
+    evaluation_page,
+    route="/evaluation",
+    title="Decision evaluation · TradingAgents",
+    on_load=AppState.load_evaluation,
 )
 app.add_page(
     settings_page,

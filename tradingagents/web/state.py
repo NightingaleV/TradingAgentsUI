@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 import reflex as rx
 
+from tradingagents.backtest import iter_grid
 from tradingagents.default_config import _ENV_OVERRIDES, DEFAULT_CONFIG
 from tradingagents.llm_clients.provider_catalog import (
     credential_status,
@@ -28,7 +29,12 @@ from tradingagents.persistence.database import database_path, webui_root
 from tradingagents.persistence.run_repository import RunRepository
 from tradingagents.persistence.secret_store import KNOWN_SECRET_NAMES, load_secrets, store_secret
 from tradingagents.portfolio import PortfolioContext
-from tradingagents.runtime.config_builder import build_run_request, request_hash
+from tradingagents.runtime.config_builder import (
+    build_run_request,
+    canonicalize_ticker,
+    request_hash,
+    saved_execution_config,
+)
 
 ANALYST_LABELS = {
     "market": "Market Analyst",
@@ -103,6 +109,25 @@ def _run_view(run: dict[str, Any]) -> dict[str, Any]:
         "active_label": run.get("active_agent") or run.get("stage") or "Queued",
         "stage_index": stage_index,
         "href": f"/runs/{run['id']}",
+    }
+
+
+def _background_job_view(job: dict[str, Any]) -> dict[str, Any]:
+    result = job.get("result", {}) or {}
+    summary = result.get("summary", {}) or {}
+    return {
+        **job,
+        "status_label": str(job.get("status", "unknown")).replace("_", " ").upper(),
+        "created_label": (job.get("created_at") or "").replace("T", " ")[:16],
+        "is_active": job.get("status") in {"queued", "running", "cancel_requested"},
+        "can_resume": job.get("kind") == "evaluation" and job.get("status") in {"failed", "cancelled"},
+        "provider_label": str((job.get("config") or {}).get("llm_provider") or "—"),
+        "model_label": str((job.get("config") or {}).get("quick_think_llm") or "—"),
+        "resolved_label": str(summary.get("resolved", result.get("resolved", "—"))),
+        "pending_label": str(summary.get("pending", result.get("pending_after", "—"))),
+        "failed_label": str(job.get("failed_units", 0)),
+        "progress_label": f"{job.get('completed_units', 0)} / {job.get('total_units', 0)}",
+        "message": str(result.get("message") or job.get("error_message") or ""),
     }
 
 
@@ -214,6 +239,33 @@ class AppState(rx.State):
     memory_rating: str = ""
     memory_date_from: str = ""
     memory_date_to: str = ""
+    memory_refresh_review: bool = False
+    memory_refresh_pending: int = 0
+    memory_refresh_tickers: int = 0
+    memory_refresh_config: dict[str, Any] = {}
+    memory_refresh_config_label: str = ""
+    memory_refresh_submission_token: str = ""
+    memory_refresh_error: str = ""
+    memory_refresh_job_id: str = ""
+    memory_refresh_job: dict[str, Any] = {}
+
+    # Historical decision evaluation.
+    evaluation_tickers: str = ""
+    evaluation_start_date: str = ""
+    evaluation_end_date: str = ""
+    evaluation_every_days: str = "7"
+    evaluation_review_ready: bool = False
+    evaluation_review: dict[str, Any] = {}
+    evaluation_config: dict[str, Any] = {}
+    evaluation_config_label: str = ""
+    evaluation_grid_label: str = ""
+    evaluation_error: str = ""
+    evaluation_submission_token: str = ""
+    evaluation_selected_job_id: str = ""
+    evaluation_jobs: list[dict[str, Any]] = []
+    evaluation_current_job: dict[str, Any] = {}
+    evaluation_cells: list[dict[str, Any]] = []
+    evaluation_rating_rows: list[dict[str, str]] = []
 
     # Settings.
     settings_rows: list[dict[str, str]] = []
@@ -386,6 +438,8 @@ class AppState(rx.State):
     @rx.event
     def load_dashboard(self):
         self.selected_run_id = ""
+        self.evaluation_selected_job_id = ""
+        self.memory_refresh_job_id = ""
         if self.announcement:
             self.announcement = re.sub(r"\[/?(?:bold|link(?:=[^\]]+)?)\]", "", self.announcement).strip(" ·")
         repository = _repo()
@@ -932,7 +986,12 @@ class AppState(rx.State):
 
     @rx.event
     def poll(self, _value: str = ""):
-        if self.selected_run_id:
+        route = self.router.page.path
+        if route == "/evaluation":
+            self.load_evaluation()
+        elif route == "/memory":
+            self.load_memory()
+        elif self.selected_run_id:
             self.load_run()
         else:
             self.load_dashboard()
@@ -991,11 +1050,182 @@ class AppState(rx.State):
         mime = "application/zip" if target.suffix == ".zip" else "application/json" if target.suffix == ".json" else "text/plain"
         return rx.download(data=target.read_bytes(), filename=target.name, mime_type=mime)
 
+    def _saved_background_config(self) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Return the immutable, secret-free settings snapshot for a queued job."""
+        settings = _repo().get_settings()
+        config = saved_execution_config(settings)
+        portfolio = settings.get("portfolio")
+        if portfolio is not None:
+            # Validate early so a stale invalid saved book cannot strand a job
+            # in the worker queue.
+            portfolio = PortfolioContext.model_validate(portfolio).model_dump(mode="json")
+        return config, portfolio
+
+    @rx.event
+    def review_memory_refresh(self):
+        from tradingagents.agents.utils.memory import TradingMemoryLog
+
+        entries = TradingMemoryLog(DEFAULT_CONFIG).get_pending_entries()
+        if not entries:
+            self.memory_refresh_error = "There are no pending decisions to refresh."
+            self.memory_refresh_review = False
+            return
+        try:
+            config, _ = self._saved_background_config()
+        except (TypeError, ValueError) as exc:
+            self.memory_refresh_error = f"Saved web settings are invalid: {exc}"
+            self.memory_refresh_review = False
+            return
+        credential = credential_status(config["llm_provider"], load_secrets())
+        if credential["required"] and not credential["configured"]:
+            self.memory_refresh_error = f"{credential['env']} is required before reflections can be queued."
+            self.memory_refresh_review = False
+            return
+        self.memory_refresh_pending = len(entries)
+        self.memory_refresh_tickers = len({entry["ticker"] for entry in entries})
+        self.memory_refresh_config = config
+        self.memory_refresh_config_label = f"{config['llm_provider']} · {config['quick_think_llm']}"
+        self.memory_refresh_submission_token = str(uuid.uuid4())
+        self.memory_refresh_error = ""
+        self.memory_refresh_review = True
+
+    @rx.event
+    def set_memory_refresh_review(self, value: bool):
+        self.memory_refresh_review = value
+        if not value:
+            self.memory_refresh_error = ""
+
+    @rx.event
+    def queue_memory_refresh(self):
+        if not self.memory_refresh_review or not self.memory_refresh_config:
+            self.memory_refresh_error = "Review the refresh before queueing it."
+            return
+        credential = credential_status(self.memory_refresh_config["llm_provider"], load_secrets())
+        if credential["required"] and not credential["configured"]:
+            self.memory_refresh_error = f"{credential['env']} is required before reflections can be queued."
+            return
+        job, _ = _repo().create_background_job(
+            "memory_refresh",
+            {"scope": "all_pending"},
+            self.memory_refresh_config,
+            self.memory_refresh_submission_token or str(uuid.uuid4()),
+            total_units=self.memory_refresh_tickers,
+        )
+        self.memory_refresh_job_id = job["id"]
+        self.memory_refresh_job = _background_job_view(job)
+        self.memory_refresh_review = False
+        self.memory_refresh_error = ""
+
+    @rx.event
+    def set_evaluation_tickers(self, value: str):
+        self.evaluation_tickers = value
+        self.evaluation_review_ready = False
+
+    @rx.event
+    def set_evaluation_start_date(self, value: str):
+        self.evaluation_start_date = value
+        self.evaluation_review_ready = False
+
+    @rx.event
+    def set_evaluation_end_date(self, value: str):
+        self.evaluation_end_date = value
+        self.evaluation_review_ready = False
+
+    @rx.event
+    def set_evaluation_every_days(self, value: str):
+        self.evaluation_every_days = value
+        self.evaluation_review_ready = False
+
+    @rx.event
+    def review_evaluation(self):
+        raw_tickers = [item.strip() for item in self.evaluation_tickers.split(",") if item.strip()]
+        if not raw_tickers:
+            self.evaluation_error = "Enter at least one comma-separated ticker."
+            self.evaluation_review_ready = False
+            return
+        try:
+            canonical = [canonicalize_ticker(item) for item in raw_tickers]
+            tickers = list(dict.fromkeys(ticker for ticker, _ in canonical))
+            asset_types = {asset_type for _, asset_type in canonical}
+            if len(asset_types) != 1:
+                raise ValueError("Use separate evaluations for stocks and crypto assets.")
+            every_days = int(self.evaluation_every_days)
+            dates = iter_grid(self.evaluation_start_date, self.evaluation_end_date, every_days)
+            if not dates:
+                raise ValueError("The requested date range contains no dates on or before today.")
+            cells = len(tickers) * len(dates)
+            if cells > 50:
+                raise ValueError(f"This grid has {cells} cells; split it into evaluations of 50 cells or fewer.")
+            config, portfolio = self._saved_background_config()
+            analysts = [key for key in config["selected_analysts"] if asset_types == {"stock"} or key != "fundamentals"]
+            if not analysts:
+                raise ValueError("The saved configuration has no analysts compatible with this asset type.")
+            config["selected_analysts"] = analysts
+        except (TypeError, ValueError) as exc:
+            self.evaluation_error = str(exc)
+            self.evaluation_review_ready = False
+            return
+        credential = credential_status(config["llm_provider"], load_secrets())
+        if credential["required"] and not credential["configured"]:
+            self.evaluation_error = f"{credential['env']} is required before an evaluation can be queued."
+            self.evaluation_review_ready = False
+            return
+        self.evaluation_review = {
+            "tickers": tickers,
+            "dates": dates,
+            "asset_type": next(iter(asset_types)),
+            "portfolio": portfolio,
+        }
+        self.evaluation_config = config
+        self.evaluation_config_label = f"{config['llm_provider']} · {config['quick_think_llm']} / {config['deep_think_llm']}"
+        self.evaluation_grid_label = f"{len(tickers)} ticker{'s' if len(tickers) != 1 else ''} × {len(dates)} dates = {cells} cells"
+        self.evaluation_submission_token = str(uuid.uuid4())
+        self.evaluation_error = ""
+        self.evaluation_review_ready = True
+
+    @rx.event
+    def queue_evaluation(self):
+        if not self.evaluation_review_ready or not self.evaluation_review or not self.evaluation_config:
+            self.evaluation_error = "Review the evaluation before queueing it."
+            return
+        credential = credential_status(self.evaluation_config["llm_provider"], load_secrets())
+        if credential["required"] and not credential["configured"]:
+            self.evaluation_error = f"{credential['env']} is required before an evaluation can be queued."
+            return
+        job, _ = _repo().create_background_job(
+            "evaluation",
+            self.evaluation_review,
+            self.evaluation_config,
+            self.evaluation_submission_token or str(uuid.uuid4()),
+            total_units=len(self.evaluation_review["tickers"]) * len(self.evaluation_review["dates"]),
+        )
+        self.evaluation_selected_job_id = job["id"]
+        self.evaluation_review_ready = False
+        self.evaluation_error = ""
+        return rx.redirect("/evaluation")
+
+    @rx.event
+    def select_evaluation_job(self, job_id: str):
+        self.evaluation_selected_job_id = job_id
+        self.load_evaluation()
+
+    @rx.event
+    def cancel_evaluation(self, job_id: str):
+        _repo().request_background_job_cancel(job_id)
+        self.load_evaluation()
+
+    @rx.event
+    def resume_evaluation(self, job_id: str):
+        if _repo().requeue_background_job(job_id):
+            self.evaluation_selected_job_id = job_id
+            self.load_evaluation()
+
     @rx.event
     def load_memory(self):
         from tradingagents.agents.utils.memory import TradingMemoryLog
 
         self.selected_run_id = ""
+        self.evaluation_selected_job_id = ""
         entries = TradingMemoryLog(DEFAULT_CONFIG).load_entries()
         filtered = []
         for entry in reversed(entries):
@@ -1019,6 +1249,57 @@ class AppState(rx.State):
             item["resolved_label"] = entry.get("resolved") or "Not resolved"
             filtered.append(item)
         self.memory_entries = filtered
+        pending = [entry for entry in entries if entry.get("pending")]
+        self.memory_refresh_pending = len(pending)
+        self.memory_refresh_tickers = len({entry["ticker"] for entry in pending})
+        if self.memory_refresh_job_id:
+            job = _repo().get_background_job(self.memory_refresh_job_id)
+            if job:
+                self.memory_refresh_job = _background_job_view(job)
+
+    @rx.event
+    def load_evaluation(self):
+        self.selected_run_id = ""
+        self.memory_refresh_job_id = ""
+        today = date.today()
+        if not self.evaluation_end_date:
+            self.evaluation_end_date = today.isoformat()
+        if not self.evaluation_start_date:
+            self.evaluation_start_date = (today - timedelta(days=35)).isoformat()
+        repository = _repo()
+        jobs = repository.list_background_jobs(kind="evaluation", limit=100)
+        self.evaluation_jobs = [_background_job_view(job) for job in jobs]
+        selected = self.evaluation_selected_job_id or (jobs[0]["id"] if jobs else "")
+        job = repository.get_background_job(selected) if selected else None
+        self.evaluation_current_job = _background_job_view(job) if job else {}
+        if not job:
+            self.evaluation_selected_job_id = ""
+        self.evaluation_cells = []
+        self.evaluation_rating_rows = []
+        if job:
+            self.evaluation_selected_job_id = job["id"]
+            self.evaluation_cells = [
+                {
+                    **cell,
+                    "status_label": str(cell["status"]).replace("_", " ").upper(),
+                    "raw_label": cell.get("raw_return") or "—",
+                    "alpha_label": cell.get("alpha_return") or "—",
+                    "holding_label": cell.get("holding_window") or "—",
+                    "resolution_label": cell.get("resolution_date") or "—",
+                    "error_label": cell.get("error_message") or "",
+                }
+                for cell in repository.list_evaluation_cells(job["id"])
+            ]
+            summary = (job.get("result") or {}).get("summary") or {}
+            self.evaluation_rating_rows = [
+                {
+                    "rating": rating,
+                    "count": str(score.get("count", 0)),
+                    "hit_rate": "—" if score.get("hit_rate") is None else f"{float(score['hit_rate']):.0%}",
+                    "mean_alpha": f"{float(score.get('mean_alpha', 0.0)):+.2%}",
+                }
+                for rating, score in summary.get("by_rating", {}).items()
+            ]
 
     @rx.event
     def set_memory_status_filter(self, value: str):

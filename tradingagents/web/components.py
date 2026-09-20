@@ -51,6 +51,7 @@ def sidebar(active: str) -> rx.Component:
         ("briefcase-business", "Portfolio", "/portfolio", "portfolio"),
         ("history", "Runs", "/runs", "runs"),
         ("brain", "Memory", "/memory", "memory"),
+        ("chart-no-axes-combined", "Evaluation", "/evaluation", "evaluation"),
         ("settings", "Settings & health", "/settings", "settings"),
     ]
     return rx.vstack(
@@ -81,6 +82,7 @@ def mobile_bar(active: str) -> rx.Component:
                 rx.dropdown_menu.item("Portfolio", on_click=rx.redirect("/portfolio")),
                 rx.dropdown_menu.item("Runs", on_click=rx.redirect("/runs")),
                 rx.dropdown_menu.item("Memory", on_click=rx.redirect("/memory")),
+                rx.dropdown_menu.item("Evaluation", on_click=rx.redirect("/evaluation")),
                 rx.dropdown_menu.separator(),
                 rx.dropdown_menu.item("Settings & health", on_click=rx.redirect("/settings")),
             ),

@@ -163,6 +163,30 @@ def effective_graph_config(request: RunRequest) -> dict[str, Any]:
     return config
 
 
+def saved_execution_config(settings: dict[str, Any]) -> dict[str, Any]:
+    """Materialize a secret-free graph configuration from saved web settings.
+
+    Background memory refreshes and evaluations do not have a single ticker to
+    build a :class:`RunRequest` around.  They nevertheless need exactly the
+    same persisted provider/model/analyst choices as a normal web analysis.
+    """
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    for key in (
+        "llm_provider", "quick_think_llm", "deep_think_llm", "backend_url",
+        "output_language", "max_debate_rounds", "max_risk_discuss_rounds",
+        "checkpoint_enabled", "temperature", "llm_max_retries", "max_tokens",
+        "benchmark_ticker", "data_vendors", "google_thinking_level",
+        "openai_reasoning_effort", "anthropic_effort",
+    ):
+        if key in settings and settings[key] is not None:
+            config[key] = copy.deepcopy(settings[key])
+    config["selected_analysts"] = list(settings.get("selected_analysts") or ANALYST_ORDER)
+    # Background work owns its own resume strategy and must never attach to a
+    # checkpoint from an interactive analysis.
+    config["checkpoint_enabled"] = False
+    return config
+
+
 def request_hash(request: RunRequest) -> str:
     payload = request.to_dict()
     payload.pop("ticker_input", None)

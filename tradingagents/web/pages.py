@@ -957,8 +957,65 @@ def memory_page() -> rx.Component:
         ), class_name="panel", width="100%",
     )
     content = rx.vstack(
-        page_header("KNOWLEDGE / MEMORY", "Decision memory", "Read-only journal of prior decisions, five-day outcomes, benchmark alpha, and reflections."),
+        page_header(
+            "KNOWLEDGE / MEMORY",
+            "Decision memory",
+            "Review prior decisions and explicitly settle outcomes once a full five-trading-day window is available.",
+            rx.button(
+                rx.icon("refresh-cw", size=15),
+                "Refresh eligible outcomes",
+                on_click=AppState.review_memory_refresh,
+                color_scheme="teal",
+            ),
+        ),
         rx.callout("Raw return is the instrument’s move across the stored holding window. Alpha is that return minus the configured benchmark over the same dates.", icon="info", color_scheme="blue", size="1", width="100%"),
+        rx.cond(
+            AppState.memory_refresh_review,
+            rx.card(
+                rx.vstack(
+                    section_title("OUTCOME REFLECTION", "Review refresh", "This action ignores filters and checks every pending live-memory ticker."),
+                    rx.text(
+                        AppState.memory_refresh_pending.to(str) + " pending decisions across " + AppState.memory_refresh_tickers.to(str) + " tickers",
+                        weight="bold",
+                    ),
+                    rx.text("Reflection model: " + AppState.memory_refresh_config_label, size="2", color=MUTED),
+                    rx.callout("Only entries with a complete market-data window are updated. Each eligible result uses one reflection call.", icon="brain", color_scheme="amber", size="1", width="100%"),
+                    rx.hstack(
+                        rx.button("Queue refresh", on_click=AppState.queue_memory_refresh, color_scheme="teal"),
+                        rx.button("Cancel", on_click=AppState.set_memory_refresh_review(False), variant="soft", color_scheme="gray"),
+                        spacing="3",
+                    ),
+                    spacing="3", align="start",
+                ), class_name="panel", width="100%",
+            ),
+            rx.fragment(),
+        ),
+        rx.cond(
+            AppState.memory_refresh_error != "",
+            rx.callout(AppState.memory_refresh_error, icon="triangle-alert", color_scheme="red", size="1", width="100%"),
+            rx.fragment(),
+        ),
+        rx.cond(
+            AppState.memory_refresh_job_id != "",
+            rx.card(
+                rx.hstack(
+                    rx.vstack(
+                        rx.text("Outcome refresh", weight="bold"),
+                        rx.text(AppState.memory_refresh_job["status_label"].to(str) + " · " + AppState.memory_refresh_job["progress_label"].to(str) + " tickers checked", size="1", color=MUTED),
+                        rx.cond(AppState.memory_refresh_job["message"] != "", rx.text(AppState.memory_refresh_job["message"], size="1", color=MUTED), rx.fragment()),
+                        spacing="1", align="start",
+                    ),
+                    rx.spacer(),
+                    rx.vstack(
+                        rx.text("Resolved " + AppState.memory_refresh_job["resolved_label"].to(str), size="2", weight="bold"),
+                        rx.text("Still pending " + AppState.memory_refresh_job["pending_label"].to(str), size="1", color=MUTED),
+                        spacing="1", align="end",
+                    ),
+                    width="100%", align="center",
+                ), class_name="panel", width="100%",
+            ),
+            rx.fragment(),
+        ),
         filters,
         rx.cond(
             AppState.memory_entries.length() > 0,
@@ -967,7 +1024,7 @@ def memory_page() -> rx.Component:
         ),
         class_name="content", align="start",
     )
-    return app_shell(content, "memory")
+    return app_shell(content, "memory", poll=True)
 
 
 def memory_card(item: rx.Var) -> rx.Component:
@@ -1006,6 +1063,158 @@ def memory_card(item: rx.Var) -> rx.Component:
             spacing="4", align="start",
         ), class_name="panel", width="100%",
     )
+
+
+def evaluation_job_row(item: rx.Var) -> rx.Component:
+    return rx.hstack(
+        rx.vstack(
+            rx.text(item["created_label"], size="2", weight="bold"),
+            rx.text(item["progress_label"].to(str) + " cells · " + item["provider_label"].to(str), size="1", color=MUTED),
+            spacing="1", align="start",
+        ),
+        rx.spacer(),
+        status_badge(item["status"]),
+        rx.button("Open", on_click=AppState.select_evaluation_job(item["id"]), variant="soft", color_scheme="gray", size="1"),
+        align="center", width="100%", padding="0.7rem 0", border_bottom=f"1px solid {BORDER}",
+    )
+
+
+def evaluation_cell_row(item: rx.Var) -> rx.Component:
+    return rx.table.row(
+        rx.table.cell(rx.text(item["ticker"], class_name="mono", weight="bold")),
+        rx.table.cell(item["trade_date"]),
+        rx.table.cell(status_badge(item["status"])),
+        rx.table.cell(signal_badge(item["rating"])),
+        rx.table.cell(rx.text(item["raw_label"], class_name="mono")),
+        rx.table.cell(rx.text(item["alpha_label"], class_name="mono")),
+        rx.table.cell(rx.text(item["resolution_label"], size="1", color=MUTED)),
+    )
+
+
+def evaluation_page() -> rx.Component:
+    form = rx.card(
+        rx.vstack(
+            section_title("HISTORICAL GRID", "Set up an evaluation", "Uses the saved web settings snapshot. Change a normal analysis configuration first if you need different models or analysts."),
+            rx.grid(
+                field("Tickers", rx.input(value=AppState.evaluation_tickers, on_change=AppState.set_evaluation_tickers, placeholder="NVDA,AAPL", width="100%")),
+                field("Start date", rx.input(type="date", value=AppState.evaluation_start_date, on_change=AppState.set_evaluation_start_date, width="100%")),
+                field("End date", rx.input(type="date", value=AppState.evaluation_end_date, on_change=AppState.set_evaluation_end_date, width="100%")),
+                field("Every calendar days", rx.input(type="number", min="1", value=AppState.evaluation_every_days, on_change=AppState.set_evaluation_every_days, width="100%")),
+                columns=rx.breakpoints(initial="1", sm="2", xl="4"), spacing="3", width="100%",
+            ),
+            rx.callout("Each cell is an independent agent analysis. The same saved portfolio context, if any, is supplied to every cell; no positions, cash, fills, or P&L are carried forward.", icon="info", color_scheme="blue", size="1", width="100%"),
+            rx.button(rx.icon("clipboard-check", size=15), "Review grid", on_click=AppState.review_evaluation, color_scheme="teal"),
+            spacing="4", align="start",
+        ), class_name="panel", width="100%",
+    )
+    review = rx.cond(
+        AppState.evaluation_review_ready,
+        rx.card(
+            rx.vstack(
+                section_title("QUEUE REVIEW", "Confirm evaluation", "The grid has a hard limit of 50 cells to prevent accidental long-running, costly sweeps."),
+                rx.text(AppState.evaluation_grid_label, weight="bold"),
+                rx.text("Configuration: " + AppState.evaluation_config_label, size="2", color=MUTED),
+                rx.callout("Recent dates can remain pending until five observed trading sessions are available. Pending cells are excluded from score averages.", icon="clock-3", color_scheme="amber", size="1", width="100%"),
+                rx.button("Queue evaluation", on_click=AppState.queue_evaluation, color_scheme="teal"),
+                spacing="3", align="start",
+            ), class_name="panel", width="100%",
+        ),
+        rx.fragment(),
+    )
+    current = rx.cond(
+        AppState.evaluation_selected_job_id != "",
+        rx.vstack(
+            rx.card(
+                rx.vstack(
+                    rx.hstack(
+                        rx.vstack(
+                            rx.text("Selected evaluation", weight="bold"),
+                            rx.text(AppState.evaluation_current_job["created_label"].to(str) + " · " + AppState.evaluation_current_job["provider_label"].to(str), size="1", color=MUTED),
+                            spacing="1", align="start",
+                        ),
+                        rx.spacer(),
+                        status_badge(AppState.evaluation_current_job["status"]),
+                        width="100%", align="center",
+                    ),
+                    rx.grid(
+                        detail_metric("Progress", AppState.evaluation_current_job["progress_label"], "list-ordered"),
+                        detail_metric("Resolved", AppState.evaluation_current_job["resolved_label"], "circle-check"),
+                        detail_metric("Pending", AppState.evaluation_current_job["pending_label"], "clock-3"),
+                        detail_metric("Failed", AppState.evaluation_current_job["failed_label"], "triangle-alert"),
+                        columns=rx.breakpoints(initial="2", md="4"), spacing="3", width="100%",
+                    ),
+                    rx.cond(AppState.evaluation_current_job["message"] != "", rx.callout(AppState.evaluation_current_job["message"], icon="triangle-alert", color_scheme="amber", size="1", width="100%"), rx.fragment()),
+                    rx.hstack(
+                        rx.cond(AppState.evaluation_current_job["is_active"], rx.button("Cancel", on_click=AppState.cancel_evaluation(AppState.evaluation_selected_job_id), color_scheme="red", variant="soft"), rx.fragment()),
+                        rx.cond(AppState.evaluation_current_job["can_resume"], rx.button("Resume evaluation", on_click=AppState.resume_evaluation(AppState.evaluation_selected_job_id), color_scheme="teal"), rx.fragment()),
+                        spacing="3",
+                    ),
+                    spacing="4", align="start",
+                ), class_name="panel", width="100%",
+            ),
+            rx.cond(
+                AppState.evaluation_rating_rows.length() > 0,
+                rx.card(
+                    rx.vstack(
+                        section_title("SCORES", "Rating-level outcomes", "Hit rate measures whether a bullish or bearish rating correctly called the sign of realized alpha. Hold has no directional hit rate."),
+                        rx.table.root(
+                            rx.table.header(rx.table.row(
+                                rx.table.column_header_cell("Rating"), rx.table.column_header_cell("Cells"),
+                                rx.table.column_header_cell("Hit rate"), rx.table.column_header_cell("Mean alpha"),
+                            )),
+                            rx.table.body(rx.foreach(AppState.evaluation_rating_rows, lambda item: rx.table.row(
+                                rx.table.cell(signal_badge(item["rating"])), rx.table.cell(item["count"]),
+                                rx.table.cell(item["hit_rate"]), rx.table.cell(rx.text(item["mean_alpha"], class_name="mono")),
+                            ))), width="100%",
+                        ),
+                        spacing="3", align="start",
+                    ), class_name="panel table-panel", width="100%",
+                ),
+                rx.fragment(),
+            ),
+            rx.card(
+                rx.vstack(
+                    section_title("CELLS", "Decision outcomes", "This research score is not a portfolio backtest or investment-performance claim."),
+                    rx.cond(
+                        AppState.evaluation_cells.length() > 0,
+                        rx.box(
+                            rx.table.root(
+                                rx.table.header(rx.table.row(
+                                    rx.table.column_header_cell("Ticker"), rx.table.column_header_cell("As of"),
+                                    rx.table.column_header_cell("Status"), rx.table.column_header_cell("Rating"),
+                                    rx.table.column_header_cell("Raw return"), rx.table.column_header_cell("Alpha"),
+                                    rx.table.column_header_cell("Resolved"),
+                                )),
+                                rx.table.body(rx.foreach(AppState.evaluation_cells, evaluation_cell_row)), width="100%",
+                            ), overflow_x="auto",
+                        ),
+                        rx.text("Cells appear as the worker completes them.", size="2", color=MUTED),
+                    ),
+                    spacing="3", align="start",
+                ), class_name="panel table-panel", width="100%",
+            ),
+            spacing="4", width="100%",
+        ),
+        rx.fragment(),
+    )
+    history = rx.card(
+        rx.vstack(
+            section_title("EVALUATION HISTORY", "Prior grids"),
+            rx.cond(
+                AppState.evaluation_jobs.length() > 0,
+                rx.vstack(rx.foreach(AppState.evaluation_jobs, evaluation_job_row), spacing="0", width="100%"),
+                rx.text("No evaluation grids have been queued yet.", size="2", color=MUTED),
+            ),
+            spacing="3", align="start",
+        ), class_name="panel", width="100%",
+    )
+    content = rx.vstack(
+        page_header("RESEARCH / EVALUATION", "Evaluate decisions over time", "Run an isolated historical grid and inspect realized benchmark-relative outcomes by rating."),
+        rx.cond(AppState.evaluation_error != "", rx.callout(AppState.evaluation_error, icon="triangle-alert", color_scheme="red", size="1", width="100%"), rx.fragment()),
+        form, review, current, history,
+        class_name="content", align="start",
+    )
+    return app_shell(content, "evaluation", poll=True)
 
 
 def credential_row(item: rx.Var) -> rx.Component:

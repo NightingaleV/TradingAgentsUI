@@ -1,4 +1,4 @@
-"""Transactional repository for runs, events, reports, settings, and worker lease."""
+"""Transactional repository for analyses, durable background jobs, and settings."""
 
 from __future__ import annotations
 
@@ -37,14 +37,19 @@ WEB_SETTING_ALLOWLIST = {
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Queue ordering needs sub-second precision: a web analysis and a
+    # background job can be submitted in the same second.
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def _decode_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     value = dict(row)
-    for key in ("config_json", "payload_json", "value_json", "analyst_wall_times_json"):
+    for key in (
+        "config_json", "payload_json", "value_json", "analyst_wall_times_json",
+        "request_json", "result_json",
+    ):
         if key in value and isinstance(value[key], str):
             try:
                 value[key.removesuffix("_json") if key != "payload_json" else "payload"] = json.loads(value[key])
@@ -173,7 +178,15 @@ class RunRepository:
     def dashboard_counts(self) -> dict[str, int]:
         since = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         with connect(self.path) as connection:
-            rows = connection.execute("SELECT status, COUNT(*) count FROM runs GROUP BY status").fetchall()
+            rows = connection.execute(
+                """
+                SELECT status, COUNT(*) count FROM (
+                    SELECT status FROM runs
+                    UNION ALL
+                    SELECT status FROM background_jobs
+                ) GROUP BY status
+                """
+            ).fetchall()
             counts = {row["status"]: row["count"] for row in rows}
             completed_30 = connection.execute(
                 "SELECT COUNT(*) FROM runs WHERE status = 'completed' AND created_at >= datetime('now', '-30 days')"
@@ -187,6 +200,213 @@ class RunRepository:
             "completed_30d": completed_30,
             "failed_today": failed_today,
         }
+
+    # --- Durable background jobs -------------------------------------------------
+
+    def create_background_job(
+        self,
+        kind: str,
+        request: dict[str, Any],
+        config: dict[str, Any],
+        submission_token: str,
+        *,
+        total_units: int = 0,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create an idempotent refresh/evaluation job with a private artifact root."""
+        if kind not in {"memory_refresh", "evaluation"}:
+            raise ValueError(f"Unsupported background job kind: {kind}")
+        job_id = str(uuid.uuid4())
+        now = utc_now()
+        root = webui_root() / "jobs" / job_id
+        with connect(self.path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO background_jobs(
+                        id, kind, submission_token, status, stage, request_json,
+                        config_json, total_units, created_at, artifact_root
+                    ) VALUES (?, ?, ?, 'queued', 'Queued', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id, kind, submission_token, json.dumps(request, sort_keys=True),
+                        json.dumps(config, sort_keys=True), max(0, int(total_units)), now, str(root),
+                    ),
+                )
+                connection.commit()
+                created = True
+            except sqlite3.IntegrityError:
+                connection.rollback()
+                row = connection.execute(
+                    "SELECT * FROM background_jobs WHERE submission_token=?", (submission_token,)
+                ).fetchone()
+                return _decode_row(row), False
+        root.mkdir(parents=True, exist_ok=True)
+        return self.get_background_job(job_id), created
+
+    def get_background_job(self, job_id: str) -> dict[str, Any] | None:
+        with connect(self.path) as connection:
+            row = connection.execute("SELECT * FROM background_jobs WHERE id=?", (job_id,)).fetchone()
+        return _decode_row(row)
+
+    def list_background_jobs(self, *, kind: str = "", limit: int = 100) -> list[dict[str, Any]]:
+        clause, params = ("", []) if not kind else ("WHERE kind=?", [kind])
+        params.append(max(1, min(limit, 500)))
+        with connect(self.path) as connection:
+            rows = connection.execute(
+                f"SELECT * FROM background_jobs {clause} ORDER BY created_at DESC LIMIT ?", params
+            ).fetchall()
+        return [_decode_row(row) for row in rows]
+
+    def emit_background_job_event(self, job_id: str, event_type: str, payload: dict[str, Any]) -> int:
+        with connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            sequence = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM background_job_events WHERE job_id=?",
+                (job_id,),
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO background_job_events(job_id, sequence, created_at, type, payload_json)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (job_id, sequence, utc_now(), event_type, json.dumps(payload, default=str, sort_keys=True)),
+            )
+            connection.commit()
+        return sequence
+
+    def list_background_job_events(self, job_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
+        with connect(self.path) as connection:
+            rows = connection.execute(
+                "SELECT * FROM background_job_events WHERE job_id=? ORDER BY sequence LIMIT ?",
+                (job_id, max(1, min(limit, 2000))),
+            ).fetchall()
+        return [_decode_row(row) for row in rows]
+
+    def update_background_job(
+        self,
+        job_id: str,
+        *,
+        stage: str | None = None,
+        active_item: str | None = None,
+        total_units: int | None = None,
+        completed_units: int | None = None,
+        failed_units: int | None = None,
+        pending_units: int | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        fields, params = ["heartbeat_at=?"], [utc_now()]
+        for column, value in (
+            ("stage", stage), ("active_item", active_item), ("total_units", total_units),
+            ("completed_units", completed_units), ("failed_units", failed_units),
+            ("pending_units", pending_units),
+        ):
+            if value is not None:
+                fields.append(f"{column}=?")
+                params.append(value)
+        if result is not None:
+            fields.append("result_json=?")
+            params.append(json.dumps(result, sort_keys=True))
+        params.append(job_id)
+        with connect(self.path) as connection:
+            connection.execute(f"UPDATE background_jobs SET {', '.join(fields)} WHERE id=?", params)
+
+    def upsert_evaluation_cell(
+        self,
+        job_id: str,
+        ticker: str,
+        trade_date: str,
+        status: str,
+        *,
+        rating: str | None = None,
+        raw_return: str | None = None,
+        alpha_return: str | None = None,
+        holding_window: str | None = None,
+        resolution_date: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        with connect(self.path) as connection:
+            connection.execute(
+                """
+                INSERT INTO evaluation_cells(
+                    job_id, ticker, trade_date, status, rating, raw_return, alpha_return,
+                    holding_window, resolution_date, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id, ticker, trade_date) DO UPDATE SET
+                    status=excluded.status, rating=COALESCE(excluded.rating, evaluation_cells.rating),
+                    raw_return=COALESCE(excluded.raw_return, evaluation_cells.raw_return),
+                    alpha_return=COALESCE(excluded.alpha_return, evaluation_cells.alpha_return),
+                    holding_window=COALESCE(excluded.holding_window, evaluation_cells.holding_window),
+                    resolution_date=COALESCE(excluded.resolution_date, evaluation_cells.resolution_date),
+                    error_message=excluded.error_message
+                """,
+                (job_id, ticker, trade_date, status, rating, raw_return, alpha_return,
+                 holding_window, resolution_date, error_message),
+            )
+
+    def list_evaluation_cells(self, job_id: str) -> list[dict[str, Any]]:
+        with connect(self.path) as connection:
+            rows = connection.execute(
+                "SELECT * FROM evaluation_cells WHERE job_id=? ORDER BY ticker, trade_date", (job_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def background_job_cancellation_requested(self, job_id: str) -> bool:
+        with connect(self.path) as connection:
+            row = connection.execute("SELECT status FROM background_jobs WHERE id=?", (job_id,)).fetchone()
+        return bool(row and row["status"] == "cancel_requested")
+
+    def request_background_job_cancel(self, job_id: str) -> bool:
+        with connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT status FROM background_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row or row["status"] not in {"queued", "running"}:
+                connection.commit()
+                return False
+            if row["status"] == "queued":
+                cursor = connection.execute(
+                    "UPDATE background_jobs SET status='cancelled', finished_at=? WHERE id=?",
+                    (utc_now(), job_id),
+                )
+            else:
+                cursor = connection.execute(
+                    "UPDATE background_jobs SET status='cancel_requested' WHERE id=?", (job_id,)
+                )
+            connection.commit()
+        return cursor.rowcount > 0
+
+    def requeue_background_job(self, job_id: str) -> bool:
+        """Resume a failed/cancelled evaluation from its private decision journal."""
+        with connect(self.path) as connection:
+            cursor = connection.execute(
+                """UPDATE background_jobs SET status='queued', stage='Queued', active_item=NULL,
+                   started_at=NULL, finished_at=NULL, heartbeat_at=NULL, error_type=NULL, error_message=NULL
+                   WHERE id=? AND kind='evaluation' AND status IN ('failed', 'cancelled')""",
+                (job_id,),
+            )
+        return cursor.rowcount > 0
+
+    def complete_background_job(self, job_id: str, result: dict[str, Any]) -> None:
+        with connect(self.path) as connection:
+            connection.execute(
+                """UPDATE background_jobs SET status='completed', stage='Completed', active_item=NULL,
+                   finished_at=?, heartbeat_at=?, result_json=? WHERE id=?""",
+                (utc_now(), utc_now(), json.dumps(result, sort_keys=True), job_id),
+            )
+
+    def cancel_background_job(self, job_id: str, result: dict[str, Any]) -> None:
+        with connect(self.path) as connection:
+            connection.execute(
+                """UPDATE background_jobs SET status='cancelled', stage='Cancelled', active_item=NULL,
+                   finished_at=?, heartbeat_at=?, result_json=? WHERE id=?""",
+                (utc_now(), utc_now(), json.dumps(result, sort_keys=True), job_id),
+            )
+
+    def fail_background_job(self, job_id: str, error_type: str, message: str, diagnostic_path: str | None = None) -> None:
+        with connect(self.path) as connection:
+            connection.execute(
+                """UPDATE background_jobs SET status='failed', stage='Failed', active_item=NULL,
+                   finished_at=?, heartbeat_at=?, error_type=?, error_message=?, diagnostic_path=? WHERE id=?""",
+                (utc_now(), utc_now(), error_type, message[:2000], diagnostic_path, job_id),
+            )
 
     def seven_day_volume(self) -> list[dict[str, Any]]:
         with connect(self.path) as connection:
@@ -254,6 +474,44 @@ class RunRepository:
             )
             connection.commit()
         return self.get_run(row["id"])
+
+    def claim_next_work_item(self, worker_id: str) -> dict[str, Any] | None:
+        """Claim the oldest queued analysis or background job atomically."""
+        with connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT source, kind, id FROM (
+                    SELECT 'run' AS source, 'analysis' AS kind, id, created_at
+                    FROM runs WHERE status='queued'
+                    UNION ALL
+                    SELECT 'background' AS source, kind, id, created_at
+                    FROM background_jobs WHERE status='queued'
+                ) ORDER BY created_at LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            now = utc_now()
+            if row["source"] == "run":
+                connection.execute(
+                    """UPDATE runs SET status='running', stage='Initializing', active_agent=NULL,
+                       started_at=?, heartbeat_at=?, worker_id=? WHERE id=? AND status='queued'""",
+                    (now, now, worker_id, row["id"]),
+                )
+            else:
+                connection.execute(
+                    """UPDATE background_jobs SET status='running', stage='Starting', active_item=NULL,
+                       started_at=?, heartbeat_at=?, worker_id=? WHERE id=? AND status='queued'""",
+                    (now, now, worker_id, row["id"]),
+                )
+            connection.commit()
+        item = self.get_run(row["id"]) if row["source"] == "run" else self.get_background_job(row["id"])
+        if item is not None:
+            item["work_source"] = row["source"]
+            item["work_kind"] = row["kind"]
+        return item
 
     def emit_event(self, run_id: str, event_type: str, payload: dict[str, Any], agent: str | None = None) -> int:
         now = utc_now()
@@ -380,6 +638,7 @@ class RunRepository:
             )
             if cursor.rowcount and active_run_id:
                 connection.execute("UPDATE runs SET heartbeat_at=? WHERE id=?", (now, active_run_id))
+                connection.execute("UPDATE background_jobs SET heartbeat_at=? WHERE id=?", (now, active_run_id))
         return cursor.rowcount == 1
 
     def acquire_worker_lease(self, worker_id: str, *, pid: int, stale_seconds: int = 15) -> bool:
@@ -429,7 +688,17 @@ class RunRepository:
                 """,
                 (utc_now(), f"-{int(stale_seconds)} seconds"),
             )
-        return cursor.rowcount
+            background = connection.execute(
+                """
+                UPDATE background_jobs SET status='failed', stage='Failed', finished_at=?, active_item=NULL,
+                    error_type='StaleWorkerLease',
+                    error_message='The worker stopped while this job was active. Resume the evaluation to continue its private journal.'
+                WHERE status IN ('running','cancel_requested')
+                  AND (heartbeat_at IS NULL OR datetime(heartbeat_at) < datetime('now', ?))
+                """,
+                (utc_now(), f"-{int(stale_seconds)} seconds"),
+            )
+        return cursor.rowcount + background.rowcount
 
     def complete_run(self, run_id: str, signal: str, stats: dict[str, int], artifacts: dict[str, str], wall_times: dict[str, float]) -> None:
         now = utc_now()

@@ -370,6 +370,16 @@ class TradingAgentsGraph:
     def resolve_pending_entries(self, ticker: str) -> None:
         self._resolve_pending_entries(ticker)
 
+    def settle_pending(self, ticker: str) -> None:
+        """Settle this ticker's matured decisions without starting an analysis.
+
+        Normal analyses invoke this work while building their initial state, so
+        the most recent decision otherwise waits for another same-ticker run.
+        This explicit entry point is used by the web memory refresh and by
+        isolated backtests once their final cell has completed.
+        """
+        self._resolve_pending_entries(ticker)
+
     def resolve_instrument_context(self, ticker: str, asset_type: str = "stock") -> str:
         """Resolve ticker identity once and return the full instrument context.
 

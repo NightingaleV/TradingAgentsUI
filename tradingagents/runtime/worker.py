@@ -18,6 +18,7 @@ from tradingagents.persistence.run_repository import RunRepository
 from tradingagents.persistence.secret_store import load_secrets
 
 from .analysis_runner import AnalysisRunner, RunCancelled, _redact
+from .background_runner import BackgroundJobCancelled, run_evaluation, run_memory_refresh
 from .models import RunEvent, RunRequest
 
 
@@ -109,6 +110,42 @@ def execute_run(run_id: str, db_path: str) -> None:
         repository.fail_run(run_id, error_type, public_message, str(diagnostic), str(activity))
 
 
+def execute_background_job(job_id: str, db_path: str) -> None:
+    """Execute a refresh/evaluation in the same isolated process as analyses."""
+    repository = RunRepository(db_path)
+    job = repository.get_background_job(job_id)
+    if not job:
+        return
+    secrets = load_secrets()
+    os.environ.update(secrets)
+    root = Path(job["artifact_root"])
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        if job["kind"] == "memory_refresh":
+            result = run_memory_refresh(job, repository)
+        elif job["kind"] == "evaluation":
+            result = run_evaluation(job, repository)
+        else:  # database constraint makes this defensive rather than expected
+            raise ValueError(f"Unsupported background job kind: {job['kind']}")
+        repository.complete_background_job(job_id, result)
+        repository.emit_background_job_event(job_id, "completed", result)
+    except BackgroundJobCancelled as exc:
+        current = repository.get_background_job(job_id) or {}
+        result = {**current.get("result", {}), "cancelled": True, "message": str(exc)}
+        repository.cancel_background_job(job_id, result)
+        repository.emit_background_job_event(job_id, "cancelled", result)
+    except BaseException as exc:
+        error_type, public_message = _public_error(exc)
+        diagnostic = root / "diagnostic.log"
+        diagnostic.write_text(str(_redact(traceback.format_exc())), encoding="utf-8")
+        repository.fail_background_job(job_id, error_type, public_message, str(diagnostic))
+        repository.emit_background_job_event(
+            job_id,
+            "error",
+            {"public_error_type": error_type, "message": public_message, "diagnostic_reference": "diagnostic.log"},
+        )
+
+
 def run_worker(*, once: bool = False, poll_seconds: float = 1.0) -> None:
     repository = RunRepository()
     worker_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
@@ -121,20 +158,25 @@ def run_worker(*, once: bool = False, poll_seconds: float = 1.0) -> None:
     while True:
         if not repository.heartbeat_worker(worker_id, pid=os.getpid(), active_run_id=None):
             return
-        run = repository.claim_next_run(worker_id)
-        if run:
-            process = context.Process(target=execute_run, args=(run["id"], str(repository.path)), daemon=False)
+        item = repository.claim_next_work_item(worker_id)
+        if item:
+            target = execute_run if item["work_source"] == "run" else execute_background_job
+            process = context.Process(target=target, args=(item["id"], str(repository.path)), daemon=False)
             process.start()
             while process.is_alive():
-                if not repository.heartbeat_worker(worker_id, pid=os.getpid(), active_run_id=run["id"]):
+                if not repository.heartbeat_worker(worker_id, pid=os.getpid(), active_run_id=item["id"]):
                     process.terminate()
                     process.join(timeout=5)
                     return
                 process.join(timeout=2)
             process.join()
-            current = repository.get_run(run["id"])
+            current = repository.get_run(item["id"]) if item["work_source"] == "run" else repository.get_background_job(item["id"])
             if current and current["status"] in {"running", "cancel_requested"}:
-                repository.fail_run(run["id"], "WorkerProcessExit", f"The isolated analysis process exited with code {process.exitcode} before recording a result.")
+                message = f"The isolated worker process exited with code {process.exitcode} before recording a result."
+                if item["work_source"] == "run":
+                    repository.fail_run(item["id"], "WorkerProcessExit", message)
+                else:
+                    repository.fail_background_job(item["id"], "WorkerProcessExit", message)
         if once:
             return
         time.sleep(max(0.2, poll_seconds))

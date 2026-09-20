@@ -263,6 +263,33 @@ print(decision)
 
 See `tradingagents/default_config.py` for all configuration options.
 
+### Current holdings
+
+By default the agents do not know what you hold, so their guidance is written
+for a reader who applies it to their own position. Pass a portfolio to have the
+Trader, Risk Analysts, and Portfolio Manager work against your actual book.
+
+```python
+from tradingagents.portfolio import PortfolioContext
+
+portfolio = PortfolioContext.model_validate({
+    "cash": 25000.0,
+    "currency": "USD",
+    "positions": [{"ticker": "NVDA", "quantity": 120, "average_price": 150.0}],
+})
+_, decision = ta.propagate("NVDA", "2026-01-15", portfolio=portfolio)
+```
+
+The CLI accepts the same JSON content with `tradingagents --portfolio my_book.json`.
+In the web console, manage
+one reusable book on the **Portfolio** page; each new analysis can include or
+omit it and always stores its own immutable snapshot.
+
+An empty `positions` list means an explicitly flat book, which differs from
+passing no portfolio. A run without portfolio context is never treated as flat.
+Portfolio context is manual research input only: it does not connect to a
+broker, place orders, calculate P&L, or manage tax lots.
+
 ## Persistence and Recovery
 
 TradingAgents persists two kinds of state across runs.
@@ -272,6 +299,24 @@ TradingAgents persists two kinds of state across runs.
 The decision log is always on. Each completed run appends its decision to `~/.tradingagents/memory/trading_memory.md`. On the next run for the same ticker, TradingAgents fetches the realised return (raw and alpha vs SPY), generates a one-paragraph reflection, and injects the most recent same-ticker decisions plus recent cross-ticker lessons into the Portfolio Manager prompt, so each analysis carries forward what worked and what didn't.
 
 Override the path with `TRADINGAGENTS_MEMORY_LOG_PATH`.
+
+In the web console, **Memory → Refresh eligible outcomes** runs that deferred
+settlement explicitly for every pending ticker. It leaves entries pending when
+the full five-session market-data window is unavailable, rather than writing a
+premature return.
+
+### Evaluating decisions over time
+
+The web console's **Evaluation** page runs the same pipeline across a
+comma-separated ticker/date grid and scores the decisions with realized alpha
+by rating. Evaluation runs use a private decision journal and cannot alter the
+live Memory lessons used by future analyses. They reuse an immutable snapshot
+of the saved web provider, model, analyst, vendor, and portfolio settings; the
+grid is limited to 50 cells and can resume after interruption.
+
+This evaluates independent decision quality, not a trading account: it does
+not model fills, cash, position changes, fees, tax, or portfolio P&L. Recent
+cells remain pending until their five-trading-day holding window is complete.
 
 ### Checkpoint resume
 

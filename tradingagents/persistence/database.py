@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def tradingagents_home() -> Path:
@@ -125,7 +125,67 @@ def ensure_database(path: str | Path | None = None) -> Path:
             );
 
             INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
+
+            CREATE TABLE IF NOT EXISTS background_jobs (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK(kind IN ('memory_refresh', 'evaluation')),
+                submission_token TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('queued','running','cancel_requested','cancelled','completed','failed')),
+                stage TEXT NOT NULL DEFAULT 'Queued',
+                active_item TEXT,
+                request_json TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                total_units INTEGER NOT NULL DEFAULT 0,
+                completed_units INTEGER NOT NULL DEFAULT 0,
+                failed_units INTEGER NOT NULL DEFAULT 0,
+                pending_units INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                heartbeat_at TEXT,
+                error_type TEXT,
+                error_message TEXT,
+                artifact_root TEXT NOT NULL,
+                diagnostic_path TEXT,
+                worker_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_status_created
+                ON background_jobs(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_kind_created
+                ON background_jobs(kind, created_at);
+
+            CREATE TABLE IF NOT EXISTS background_job_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL REFERENCES background_jobs(id),
+                sequence INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                UNIQUE(job_id, sequence)
+            );
+            CREATE INDEX IF NOT EXISTS idx_background_job_events_sequence
+                ON background_job_events(job_id, sequence);
+
+            CREATE TABLE IF NOT EXISTS evaluation_cells (
+                job_id TEXT NOT NULL REFERENCES background_jobs(id),
+                ticker TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                status TEXT NOT NULL,
+                rating TEXT,
+                raw_return TEXT,
+                alpha_return TEXT,
+                holding_window TEXT,
+                resolution_date TEXT,
+                error_message TEXT,
+                PRIMARY KEY(job_id, ticker, trade_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_evaluation_cells_job_status
+                ON evaluation_cells(job_id, status);
+
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
             """
         )
     (webui_root() / "runs").mkdir(parents=True, exist_ok=True)
+    (webui_root() / "jobs").mkdir(parents=True, exist_ok=True)
     return db_path
