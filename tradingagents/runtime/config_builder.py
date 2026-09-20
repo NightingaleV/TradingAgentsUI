@@ -14,9 +14,9 @@ from urllib.parse import urlparse
 from tradingagents.dataflows.symbol_utils import normalize_symbol
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients.provider_catalog import provider_metadata, provider_models
+from tradingagents.portfolio import PortfolioContext
 
 from .models import RunRequest
-
 
 ANALYST_ORDER = ("market", "social", "news", "fundamentals")
 CRYPTO_SUFFIXES = ("-USD", "-USDT", "-USDC", "-BTC", "-ETH")
@@ -118,6 +118,15 @@ def build_run_request(draft: dict[str, Any]) -> RunRequest:
     if benchmark and not TICKER_RE.fullmatch(benchmark):
         raise ValueError("Benchmark ticker contains unsupported characters.")
 
+    portfolio: dict[str, Any] | None = None
+    if draft.get("portfolio") is not None:
+        try:
+            portfolio = PortfolioContext.model_validate(draft["portfolio"]).model_dump(
+                mode="json"
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Portfolio is not valid: {exc}") from exc
+
     return RunRequest(
         ticker_input=str(draft.get("ticker", ticker)).strip() or "SPY",
         ticker=ticker,
@@ -140,6 +149,7 @@ def build_run_request(draft: dict[str, Any]) -> RunRequest:
         max_tokens=_optional_int(draft.get("max_tokens"), positive=True),
         benchmark_ticker=normalize_symbol(benchmark) if benchmark else None,
         data_vendors=vendors,
+        portfolio=portfolio,
     )
 
 

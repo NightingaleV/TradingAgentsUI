@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Protocol
 
-
 AnalystKey = Literal["market", "social", "news", "fundamentals"]
 AssetType = Literal["stock", "crypto"]
 
@@ -33,6 +32,7 @@ class RunRequest:
     max_tokens: int | None = None
     benchmark_ticker: str | None = None
     data_vendors: dict[str, str] = field(default_factory=dict)
+    portfolio: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -40,7 +40,7 @@ class RunRequest:
         return value
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "RunRequest":
+    def from_dict(cls, value: dict[str, Any]) -> RunRequest:
         allowed = {field.name for field in cls.__dataclass_fields__.values()}
         filtered = {key: item for key, item in value.items() if key in allowed}
         filtered["analysts"] = tuple(filtered.get("analysts", ()))

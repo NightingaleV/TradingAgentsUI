@@ -6,12 +6,12 @@ from .pages import (
     dashboard_page,
     memory_page,
     new_analysis_page,
+    portfolio_page,
     run_detail_page,
     runs_page,
     settings_page,
 )
 from .state import AppState
-
 
 app = rx.App(
     stylesheets=["/styles.css"],
@@ -30,6 +30,12 @@ app.add_page(
     route="/new-analysis",
     title="New analysis · TradingAgents",
     on_load=AppState.load_new_analysis,
+)
+app.add_page(
+    portfolio_page,
+    route="/portfolio",
+    title="Portfolio · TradingAgents",
+    on_load=AppState.load_portfolio,
 )
 app.add_page(
     run_detail_page,

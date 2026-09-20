@@ -7,18 +7,20 @@ import os
 import re
 import shutil
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 
-from tradingagents.graph.analyst_execution import AnalystWallTimeTracker, build_analyst_execution_plan
+from tradingagents.graph.analyst_execution import (
+    AnalystWallTimeTracker,
+    build_analyst_execution_plan,
+)
 from tradingagents.graph.checkpointer import checkpoint_step, clear_checkpoint
+from tradingagents.portfolio import PortfolioContext
 from tradingagents.reporting import write_report_tree
 
 from .config_builder import effective_graph_config
 from .models import EventSink, RunEvent, RunRequest, RunResult
 from .stats import StatsCallbackHandler
-
 
 REPORT_PRODUCERS = {
     "market_report": "Market Analyst",
@@ -270,7 +272,7 @@ class _Projection:
                         "Conservative Analyst": ("conservative_history", str(risk.get("conservative_history") or "").strip()),
                         "Neutral Analyst": ("neutral_history", str(risk.get("neutral_history") or "").strip()),
                     }
-                    for agent, (key, content) in risk_values.items():
+                    for _agent, (key, content) in risk_values.items():
                         if content:
                             self._report(key, content)
                     risk_judge = str(risk.get("judge_decision") or "").strip()
@@ -319,31 +321,48 @@ class AnalysisRunner:
             config=config,
             callbacks=[stats],
         )
+        portfolio = (
+            PortfolioContext.model_validate(request.portfolio)
+            if request.portfolio is not None
+            else None
+        )
         graph.ticker = request.ticker
         recovery_mode = getattr(request, "_recovery_mode", None)
         raw_config = getattr(sink, "run_config", {})
         recovery_mode = raw_config.get("_recovery_mode", recovery_mode or "fresh")
         if recovery_mode == "start_fresh" and request.checkpoint_enabled:
-            clear_checkpoint(config["data_cache_dir"], request.ticker, request.trade_date, graph.run_signature(request.asset_type))
-        graph.resolve_pending_entries(request.ticker)
-        past_context = graph.memory_log.get_past_context(request.ticker, as_of=graph.memory_as_of(request.trade_date))
-        instrument_context = graph.resolve_instrument_context(request.ticker, request.asset_type)
-        init_state = graph.propagator.create_initial_state(
+            clear_checkpoint(
+                config["data_cache_dir"],
+                request.ticker,
+                request.trade_date,
+                graph.run_signature(request.asset_type, portfolio),
+            )
+        init_state = graph.create_run_state(
             request.ticker,
             request.trade_date,
-            asset_type=request.asset_type,
-            past_context=past_context,
-            instrument_context=instrument_context,
+            request.asset_type,
+            portfolio,
         )
         args = graph.propagator.get_graph_args(callbacks=[stats])
         checkpoint_tid = None
         checkpoint_allowed = request.checkpoint_enabled and recovery_mode != "retry"
         if checkpoint_allowed:
-            checkpoint_tid = graph.begin_checkpoint(request.ticker, request.trade_date, request.asset_type)
+            checkpoint_tid = graph.begin_checkpoint(
+                request.ticker, request.trade_date, request.asset_type, portfolio
+            )
             if checkpoint_tid:
                 args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = checkpoint_tid
         resumed = graph.resuming
-        step = checkpoint_step(config["data_cache_dir"], request.ticker, request.trade_date, graph.run_signature(request.asset_type)) if checkpoint_allowed else None
+        step = (
+            checkpoint_step(
+                config["data_cache_dir"],
+                request.ticker,
+                request.trade_date,
+                graph.run_signature(request.asset_type, portfolio),
+            )
+            if checkpoint_allowed
+            else None
+        )
         sink.project(run_id, resumed=resumed, checkpoint_step=step)
         sink.emit(run_id, RunEvent("checkpoint", {"enabled": checkpoint_allowed, "resumed": resumed, "step": step}))
 
@@ -371,7 +390,9 @@ class AnalysisRunner:
         graph.curr_state = final_state
         graph.log_state(request.trade_date, final_state)
         graph.memory_log.store_decision(request.ticker, request.trade_date, final_state["final_trade_decision"])
-        graph.clear_checkpoint_on_success(request.ticker, request.trade_date, request.asset_type)
+        graph.clear_checkpoint_on_success(
+            request.ticker, request.trade_date, request.asset_type, portfolio
+        )
         elapsed = int(time.monotonic() - started)
         final_stats = stats.get_stats()
         final_stats["elapsed_seconds"] = elapsed

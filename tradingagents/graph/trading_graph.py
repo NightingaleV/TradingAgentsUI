@@ -33,6 +33,7 @@ from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
+from tradingagents.portfolio import PortfolioContext
 from tradingagents.reporting import write_report_tree
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -323,7 +324,7 @@ class TradingAgentsGraph:
             )
             return None, None, None, None
 
-    def resolve_pending_entries(self, ticker: str) -> None:
+    def _resolve_pending_entries(self, ticker: str) -> None:
         """Resolve pending log entries for ticker at the start of a new run.
 
         Fetches returns for each same-ticker pending entry, generates reflections,
@@ -364,9 +365,10 @@ class TradingAgentsGraph:
         if updates:
             self.memory_log.batch_update_with_outcomes(updates)
 
-    # Backward-compatible aliases for callers predating the public runtime API.
-    def _resolve_pending_entries(self, ticker: str) -> None:
-        self.resolve_pending_entries(ticker)
+    # Public spelling used by the durable runtime. Keep the legacy underscored
+    # method as the implementation for existing callers and tests.
+    def resolve_pending_entries(self, ticker: str) -> None:
+        self._resolve_pending_entries(ticker)
 
     def resolve_instrument_context(self, ticker: str, asset_type: str = "stock") -> str:
         """Resolve ticker identity once and return the full instrument context.
@@ -394,24 +396,36 @@ class TradingAgentsGraph:
     def _memory_as_of(self, trade_date) -> str | None:
         return self.memory_as_of(trade_date)
 
-    def run_signature(self, asset_type: str) -> str:
+    def run_signature(
+        self, asset_type: str, portfolio: PortfolioContext | None = None
+    ) -> str:
         """Graph-shape inputs that must invalidate a checkpoint if changed.
 
         Keyed into the checkpoint thread ID so a resume under a different analyst
-        selection, debate/risk depth, or asset mode starts fresh instead of
-        silently continuing the previous graph (#1089).
+        selection, debate/risk depth, asset mode, or portfolio starts fresh
+        instead of silently continuing the previous graph.
         """
         return "|".join([
             "analysts=" + ",".join(self.selected_analysts),
             f"debate={self.config['max_debate_rounds']}",
             f"risk={self.config['max_risk_discuss_rounds']}",
             f"asset={asset_type}",
+            f"portfolio={portfolio.fingerprint() if portfolio is not None else 'none'}",
         ])
 
-    def _run_signature(self, asset_type: str) -> str:
-        return self.run_signature(asset_type)
+    def _run_signature(
+        self, asset_type: str, portfolio: PortfolioContext | None = None
+    ) -> str:
+        """Backward-compatible internal alias for the checkpoint signature."""
+        return self.run_signature(asset_type, portfolio)
 
-    def propagate(self, company_name, trade_date, asset_type: str = "stock"):
+    def propagate(
+        self,
+        company_name,
+        trade_date,
+        asset_type: str = "stock",
+        portfolio: PortfolioContext | None = None,
+    ):
         """Run the trading agents graph for a company on a specific date.
 
         ``asset_type`` selects between the stock pipeline (default) and the
@@ -429,16 +443,22 @@ class TradingAgentsGraph:
         """
         self.ticker = company_name
 
-        # Resolve any pending memory-log entries for this ticker before the pipeline runs.
-        self.resolve_pending_entries(company_name)
-
-        with self.checkpoint_scope(company_name, trade_date, asset_type) as thread_id_value:
+        with self.checkpoint_scope(
+            company_name, trade_date, asset_type, portfolio
+        ) as thread_id_value:
             return self._run_graph(
                 company_name, trade_date, asset_type=asset_type,
                 checkpoint_thread_id=thread_id_value,
+                portfolio=portfolio,
             )
 
-    def begin_checkpoint(self, company_name, trade_date, asset_type: str = "stock") -> str | None:
+    def begin_checkpoint(
+        self,
+        company_name,
+        trade_date,
+        asset_type: str = "stock",
+        portfolio: PortfolioContext | None = None,
+    ) -> str | None:
         """Recompile the graph with a per-ticker checkpointer and return the
         ``thread_id`` to inject into the stream/invoke ``config`` (or ``None``
         when checkpointing is disabled).
@@ -452,7 +472,7 @@ class TradingAgentsGraph:
         self._resuming = False
         if not self.config.get("checkpoint_enabled"):
             return None
-        signature = self.run_signature(asset_type)
+        signature = self.run_signature(asset_type, portfolio)
         self._checkpointer_ctx = get_checkpointer(self.config["data_cache_dir"], company_name)
         saver = self._checkpointer_ctx.__enter__()
         self.graph = self.workflow.compile(checkpointer=saver)
@@ -491,19 +511,31 @@ class TradingAgentsGraph:
         self._resuming = False
 
     @contextmanager
-    def checkpoint_scope(self, company_name, trade_date, asset_type: str = "stock"):
+    def checkpoint_scope(
+        self,
+        company_name,
+        trade_date,
+        asset_type: str = "stock",
+        portfolio: PortfolioContext | None = None,
+    ):
         """Context-manager form of begin/end_checkpoint for the propagate path."""
         try:
-            yield self.begin_checkpoint(company_name, trade_date, asset_type)
+            yield self.begin_checkpoint(company_name, trade_date, asset_type, portfolio)
         finally:
             self.end_checkpoint()
 
-    def clear_checkpoint_on_success(self, company_name, trade_date, asset_type: str = "stock"):
+    def clear_checkpoint_on_success(
+        self,
+        company_name,
+        trade_date,
+        asset_type: str = "stock",
+        portfolio: PortfolioContext | None = None,
+    ):
         """Drop a completed run's checkpoint so a later run starts fresh (#1249)."""
         if self.config.get("checkpoint_enabled"):
             clear_checkpoint(
                 self.config["data_cache_dir"], company_name, str(trade_date),
-                self.run_signature(asset_type),
+                self.run_signature(asset_type, portfolio),
             )
 
     def save_reports(self, final_state, ticker, save_path=None) -> Path:
@@ -521,23 +553,39 @@ class TradingAgentsGraph:
             )
         return write_report_tree(final_state, ticker, save_path)
 
-    def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
-                   checkpoint_thread_id: str | None = None):
-        """Execute the graph and write the resulting state to disk and memory log."""
-        # Initialize state — inject memory log context for PM and the
-        # deterministically resolved instrument identity for all agents. On a
-        # historical run, gate lessons to those whose outcome was known by the
-        # trade date so a backtest can't learn from the future (#1251).
+    def create_run_state(
+        self,
+        company_name,
+        trade_date,
+        asset_type: str = "stock",
+        portfolio: PortfolioContext | None = None,
+    ) -> dict[str, Any]:
+        """Create complete initial state for programmatic and CLI graph runs."""
+        self.resolve_pending_entries(company_name)
         past_context = self.memory_log.get_past_context(
             company_name, as_of=self.memory_as_of(trade_date)
         )
         instrument_context = self.resolve_instrument_context(company_name, asset_type)
-        init_agent_state = self.propagator.create_initial_state(
+        return self.propagator.create_initial_state(
             company_name,
             trade_date,
             asset_type=asset_type,
             past_context=past_context,
             instrument_context=instrument_context,
+            portfolio_context=portfolio.render(company_name) if portfolio is not None else "",
+        )
+
+    def _run_graph(
+        self,
+        company_name,
+        trade_date,
+        asset_type: str = "stock",
+        checkpoint_thread_id: str | None = None,
+        portfolio: PortfolioContext | None = None,
+    ):
+        """Execute the graph and write the resulting state to disk and memory log."""
+        init_agent_state = self.create_run_state(
+            company_name, trade_date, asset_type, portfolio
         )
         args = self.propagator.get_graph_args()
 
@@ -584,7 +632,7 @@ class TradingAgentsGraph:
         )
 
         # Clear checkpoint on successful completion to avoid stale state.
-        self.clear_checkpoint_on_success(company_name, trade_date, asset_type)
+        self.clear_checkpoint_on_success(company_name, trade_date, asset_type, portfolio)
 
         return final_state, self.process_signal(final_state["final_trade_decision"])
 

@@ -11,7 +11,6 @@ from typing import Any
 
 from .database import connect, database_path, ensure_database, webui_root
 
-
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 RUN_STATUSES = {"queued", "running", "cancel_requested", *TERMINAL_STATUSES}
 WEB_SETTING_ALLOWLIST = {
@@ -33,6 +32,7 @@ WEB_SETTING_ALLOWLIST = {
     "google_thinking_level",
     "openai_reasoning_effort",
     "anthropic_effort",
+    "portfolio",
 }
 
 
@@ -229,6 +229,13 @@ class RunRepository:
                 """,
                 (key, json.dumps(value, sort_keys=True), utc_now()),
             )
+
+    def delete_setting(self, key: str) -> None:
+        """Remove an optional local default without touching run snapshots."""
+        if key not in WEB_SETTING_ALLOWLIST:
+            raise ValueError(f"Web setting is not allowed: {key}")
+        with connect(self.path) as connection:
+            connection.execute("DELETE FROM web_settings WHERE key = ?", (key,))
 
     def claim_next_run(self, worker_id: str) -> dict[str, Any] | None:
         with connect(self.path) as connection:

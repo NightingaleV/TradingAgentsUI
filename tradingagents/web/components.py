@@ -8,7 +8,6 @@ import reflex as rx
 
 from .state import AppState
 
-
 ACCENT = "#5dd9c1"
 PANEL = "#111923"
 BORDER = "#263242"
@@ -49,6 +48,7 @@ def sidebar(active: str) -> rx.Component:
     items = [
         ("layout-dashboard", "Overview", "/", "dashboard"),
         ("plus", "New analysis", "/new-analysis", "new"),
+        ("briefcase-business", "Portfolio", "/portfolio", "portfolio"),
         ("history", "Runs", "/runs", "runs"),
         ("brain", "Memory", "/memory", "memory"),
         ("settings", "Settings & health", "/settings", "settings"),
@@ -78,6 +78,7 @@ def mobile_bar(active: str) -> rx.Component:
             rx.dropdown_menu.content(
                 rx.dropdown_menu.item("Overview", on_click=rx.redirect("/")),
                 rx.dropdown_menu.item("New analysis", on_click=rx.redirect("/new-analysis")),
+                rx.dropdown_menu.item("Portfolio", on_click=rx.redirect("/portfolio")),
                 rx.dropdown_menu.item("Runs", on_click=rx.redirect("/runs")),
                 rx.dropdown_menu.item("Memory", on_click=rx.redirect("/memory")),
                 rx.dropdown_menu.separator(),

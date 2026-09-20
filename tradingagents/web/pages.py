@@ -163,6 +163,66 @@ def signal_like_badge(asset_type) -> rx.Component:
     )
 
 
+def portfolio_context_section() -> rx.Component:
+    """Expose use/omit choice without duplicating book editing in the run form."""
+    saved = rx.vstack(
+        rx.hstack(
+            rx.switch(
+                checked=AppState.use_saved_portfolio,
+                on_change=AppState.set_use_saved_portfolio,
+                color_scheme="teal",
+            ),
+            rx.vstack(
+                rx.text("Use saved portfolio", weight="bold", size="2"),
+                rx.text(
+                    AppState.portfolio_status + " · A snapshot is stored with this run.",
+                    color=MUTED,
+                    size="1",
+                ),
+                spacing="1",
+                align="start",
+            ),
+            rx.spacer(),
+            rx.link("Manage book", href="/portfolio", color=ACCENT, size="2"),
+            align="center",
+            width="100%",
+        ),
+        rx.cond(
+            AppState.use_saved_portfolio,
+            rx.callout(
+                "The Trader, Risk Analysts, and Portfolio Manager receive this book. Research agents stay independent of it.",
+                icon="briefcase-business",
+                color_scheme="teal",
+                size="1",
+                width="100%",
+            ),
+            rx.callout(
+                "No portfolio context will be supplied. Agents will not assume that your book is flat.",
+                icon="info",
+                color_scheme="blue",
+                size="1",
+                width="100%",
+            ),
+        ),
+        spacing="3",
+        align="start",
+        width="100%",
+    )
+    missing = rx.vstack(
+        rx.text("No saved portfolio", weight="bold", size="2"),
+        rx.text(
+            "This run will receive no holdings context until you save a portfolio.",
+            color=MUTED,
+            size="1",
+        ),
+        rx.link(rx.button("Open portfolio", variant="soft", color_scheme="teal"), href="/portfolio"),
+        spacing="3",
+        align="start",
+        width="100%",
+    )
+    return rx.cond(AppState.portfolio_saved, saved, missing)
+
+
 def new_analysis_page() -> rx.Component:
     instrument = rx.grid(
         field("Ticker", rx.input(value=AppState.ticker, on_change=AppState.set_ticker, placeholder="SPY, 0700.HK, BTC-USD", max_length=32, width="100%"), "Canonicalized and classified on review."),
@@ -185,6 +245,7 @@ def new_analysis_page() -> rx.Component:
         ), "Sets both research and risk debate rounds; advanced fields can override."),
         spacing="4", align="start", width="100%",
     )
+    portfolio = portfolio_context_section()
     endpoint_field = rx.cond(
         AppState.llm_provider == "azure",
         field(
@@ -259,6 +320,7 @@ def new_analysis_page() -> rx.Component:
                     summary_line("Deep model", AppState.review_config["deep_think_llm"]),
                     summary_line("Analysts", AppState.review_config["analysts"].to(list[str]).join(", ")),
                     summary_line("Rounds", AppState.review_config["max_debate_rounds"].to(int).to_string() + " research · " + AppState.review_config["max_risk_discuss_rounds"].to(int).to_string() + " risk"),
+                    summary_line("Portfolio", AppState.review_portfolio_label),
                     rx.cond(AppState.review_config["asset_type"] == "crypto", rx.callout("Fundamentals is excluded for crypto; the graph and visible team now match.", icon="info", color_scheme="blue", size="1"), rx.fragment()),
                     rx.cond(AppState.credential_hint != "", rx.callout(AppState.credential_hint, icon="key-round", color_scheme="amber", size="1"), rx.fragment()),
                     rx.button(rx.icon("list-plus", size=16), "Queue analysis", on_click=AppState.queue_analysis, color_scheme="teal", size="3", width="100%", disabled=AppState.credential_hint != ""),
@@ -273,9 +335,10 @@ def new_analysis_page() -> rx.Component:
     form_content = rx.form(
         rx.vstack(
             form_section("01", "scan-search", "Instrument", "Identify the subject and point-in-time boundary.", instrument),
-            form_section("02", "users", "Research team", "Choose the evidence pipeline and debate depth.", team),
-            form_section("03", "cpu", "Models", "Select the provider, endpoint, and reasoning roles.", models),
-            form_section("04", "shield-check", "Reliability", "Control recovery and advanced runtime bounds.", reliability),
+            form_section("02", "briefcase-business", "Portfolio context", "Choose whether this immutable run snapshot should include your saved book.", portfolio),
+            form_section("03", "users", "Research team", "Choose the evidence pipeline and debate depth.", team),
+            form_section("04", "cpu", "Models", "Select the provider, endpoint, and reasoning roles.", models),
+            form_section("05", "shield-check", "Reliability", "Control recovery and advanced runtime bounds.", reliability),
             rx.button(rx.icon("clipboard-check", size=17), "Review configuration", type="button", on_click=AppState.review_configuration, variant="surface", color_scheme="teal", size="3", width="100%"),
             spacing="4", width="100%",
         ), width="100%",
@@ -286,6 +349,237 @@ def new_analysis_page() -> rx.Component:
         class_name="content", align="start",
     )
     return app_shell(content, "new")
+
+
+def portfolio_position_row(position: rx.Var) -> rx.Component:
+    return rx.grid(
+        rx.input(
+            value=position["ticker"],
+            on_change=lambda value: AppState.set_portfolio_position(
+                position["id"], "ticker", value
+            ),
+            placeholder="NVDA",
+            max_length=32,
+            width="100%",
+        ),
+        rx.input(
+            type="number",
+            value=position["quantity"],
+            on_change=lambda value: AppState.set_portfolio_position(
+                position["id"], "quantity", value
+            ),
+            placeholder="120",
+            width="100%",
+        ),
+        rx.input(
+            type="number",
+            value=position["average_price"],
+            on_change=lambda value: AppState.set_portfolio_position(
+                position["id"], "average_price", value
+            ),
+            placeholder="150.00 (optional)",
+            width="100%",
+        ),
+        rx.icon_button(
+            "trash-2",
+            on_click=AppState.remove_portfolio_position(position["id"]),
+            color_scheme="red",
+            variant="ghost",
+            aria_label="Remove position",
+        ),
+        columns=rx.breakpoints(initial="1", md="minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) 2.5rem"),
+        spacing="3",
+        width="100%",
+        align_items="center",
+        padding="0.65rem 0",
+        border_bottom=f"1px solid {BORDER}",
+    )
+
+
+def clear_portfolio_dialog() -> rx.Component:
+    return rx.alert_dialog.root(
+        rx.alert_dialog.trigger(
+            rx.button(rx.icon("trash-2", size=15), "Clear saved book", variant="soft", color_scheme="red")
+        ),
+        rx.alert_dialog.content(
+            rx.alert_dialog.title("Clear the saved portfolio?"),
+            rx.alert_dialog.description(
+                "New analyses will receive no portfolio context. Existing run snapshots and reports remain unchanged."
+            ),
+            rx.flex(
+                rx.alert_dialog.cancel(rx.button("Keep portfolio", variant="soft", color_scheme="gray")),
+                rx.alert_dialog.action(
+                    rx.button("Clear saved book", color_scheme="red", on_click=AppState.clear_portfolio)
+                ),
+                spacing="3",
+                justify="end",
+                margin_top="1.5rem",
+            ),
+        ),
+    )
+
+
+def portfolio_page() -> rx.Component:
+    positions = rx.card(
+        rx.vstack(
+            rx.hstack(
+                section_title(
+                    "POSITIONS",
+                    "Current holdings",
+                    "Quantities are signed units; negative quantities represent short positions.",
+                ),
+                rx.spacer(),
+                rx.button(
+                    rx.icon("plus", size=15),
+                    "Add position",
+                    on_click=AppState.add_portfolio_position,
+                    color_scheme="teal",
+                    variant="soft",
+                ),
+                width="100%",
+                align="center",
+                wrap="wrap",
+            ),
+            rx.hstack(
+                rx.text("Ticker", size="1", weight="bold", color=MUTED, width="100%"),
+                rx.text("Quantity", size="1", weight="bold", color=MUTED, width="100%"),
+                rx.text("Average price", size="1", weight="bold", color=MUTED, width="100%"),
+                rx.box(width="2.5rem"),
+                class_name="portfolio-table-heading",
+                width="100%",
+            ),
+            rx.cond(
+                AppState.portfolio_positions.length() > 0,
+                rx.vstack(rx.foreach(AppState.portfolio_positions, portfolio_position_row), spacing="0", width="100%"),
+                rx.text(
+                    "No positions entered. Saving this state creates an explicit flat book.",
+                    color=MUTED,
+                    size="2",
+                    padding="1rem 0",
+                ),
+            ),
+            spacing="4",
+            align="start",
+            width="100%",
+        ),
+        class_name="panel",
+        width="100%",
+    )
+    cash = rx.card(
+        rx.vstack(
+            section_title(
+                "CASH",
+                "Available capital",
+                "Both fields are optional. Leaving cash blank does not imply zero cash.",
+            ),
+            rx.grid(
+                field(
+                    "Cash available",
+                    rx.input(
+                        type="number",
+                        value=AppState.portfolio_cash,
+                        on_change=AppState.set_portfolio_cash,
+                        placeholder="25000.00",
+                        width="100%",
+                    ),
+                ),
+                field(
+                    "Currency",
+                    rx.input(
+                        value=AppState.portfolio_currency,
+                        on_change=AppState.set_portfolio_currency,
+                        placeholder="USD",
+                        max_length=16,
+                        width="100%",
+                    ),
+                ),
+                columns=rx.breakpoints(initial="1", md="2"),
+                spacing="4",
+                width="100%",
+            ),
+            spacing="4",
+            align="start",
+            width="100%",
+        ),
+        class_name="panel",
+        width="100%",
+    )
+    summary = rx.card(
+        rx.vstack(
+            section_title("SAVED STATE", "Portfolio default"),
+            rx.hstack(
+                rx.center(rx.icon("briefcase-business", size=18, color=ACCENT), class_name="metric-icon"),
+                rx.text(AppState.portfolio_status, weight="bold", size="3"),
+                width="100%",
+                align="center",
+            ),
+            rx.cond(
+                AppState.portfolio_saved,
+                rx.text(
+                    "New analyses apply this book by default, but each run can opt out before review.",
+                    color=MUTED,
+                    size="2",
+                ),
+                rx.text(
+                    "New analyses receive no context until you save a book. Agents will not assume your holdings are flat.",
+                    color=MUTED,
+                    size="2",
+                ),
+            ),
+            rx.callout(
+                "This is manual research context only. It cannot connect to a broker, place trades, calculate P&L, or manage tax lots.",
+                icon="shield-check",
+                color_scheme="blue",
+                size="1",
+                width="100%",
+            ),
+            spacing="4",
+            align="start",
+            width="100%",
+        ),
+        class_name="panel",
+        width="100%",
+    )
+    actions = rx.hstack(
+        rx.button(
+            rx.icon("save", size=16),
+            "Save portfolio",
+            on_click=AppState.save_portfolio,
+            color_scheme="teal",
+            size="3",
+        ),
+        rx.cond(AppState.portfolio_saved, clear_portfolio_dialog(), rx.fragment()),
+        spacing="3",
+        width="100%",
+        wrap="wrap",
+    )
+    content = rx.vstack(
+        page_header(
+            "PORTFOLIO / CONTEXT",
+            "Manage your portfolio",
+            "Save one reusable, local book for portfolio-aware analysis. Each queued run stores an immutable snapshot.",
+            rx.link(
+                rx.button(rx.icon("plus", size=16), "New analysis", color_scheme="teal"),
+                href="/new-analysis",
+            ),
+        ),
+        rx.cond(
+            AppState.portfolio_error != "",
+            rx.callout(AppState.portfolio_error, icon="triangle-alert", color_scheme="red", width="100%"),
+            rx.fragment(),
+        ),
+        rx.cond(
+            AppState.portfolio_notice != "",
+            rx.callout(AppState.portfolio_notice, icon="circle-check", color_scheme="green", width="100%"),
+            rx.fragment(),
+        ),
+        rx.grid(cash, summary, columns=rx.breakpoints(initial="1", lg="3fr 2fr"), spacing="4", width="100%"),
+        positions,
+        actions,
+        class_name="content",
+        align="start",
+    )
+    return app_shell(content, "portfolio")
 
 
 def runs_page() -> rx.Component:

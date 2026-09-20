@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 import reflex as rx
 
-from tradingagents.default_config import DEFAULT_CONFIG, _ENV_OVERRIDES
+from tradingagents.default_config import _ENV_OVERRIDES, DEFAULT_CONFIG
 from tradingagents.llm_clients.provider_catalog import (
     credential_status,
     list_providers,
@@ -27,8 +27,8 @@ from tradingagents.llm_clients.provider_catalog import (
 from tradingagents.persistence.database import database_path, webui_root
 from tradingagents.persistence.run_repository import RunRepository
 from tradingagents.persistence.secret_store import KNOWN_SECRET_NAMES, load_secrets, store_secret
+from tradingagents.portfolio import PortfolioContext
 from tradingagents.runtime.config_builder import build_run_request, request_hash
-
 
 ANALYST_LABELS = {
     "market": "Market Analyst",
@@ -109,7 +109,7 @@ def _run_view(run: dict[str, Any]) -> dict[str, Any]:
 def _model_labels(provider: str, mode: str) -> tuple[list[str], dict[str, str]]:
     options = provider_models(provider, mode)
     labels = [label for label, _ in options]
-    mapping = {label: value for label, value in options}
+    mapping = dict(options)
     return labels, mapping
 
 
@@ -170,6 +170,19 @@ class AppState(rx.State):
     submission_token: str = ""
     form_error: str = ""
     credential_hint: str = ""
+    use_saved_portfolio: bool = False
+    review_portfolio_label: str = ""
+
+    # Reusable portfolio draft. Only a successfully saved book is offered to
+    # new analyses; in-progress edits remain on the Portfolio page.
+    saved_portfolio: dict[str, Any] = {}
+    portfolio_saved: bool = False
+    portfolio_status: str = "No portfolio saved"
+    portfolio_cash: str = ""
+    portfolio_currency: str = ""
+    portfolio_positions: list[dict[str, str]] = []
+    portfolio_error: str = ""
+    portfolio_notice: str = ""
 
     # Run history filters.
     filter_ticker: str = ""
@@ -283,6 +296,48 @@ class AppState(rx.State):
     def set_news_vendor(self, value: str):
         self.news_vendor = value
         self.review_ready = False
+
+    @rx.event
+    def set_use_saved_portfolio(self, value: bool):
+        self.use_saved_portfolio = value
+        self.review_ready = False
+
+    @rx.event
+    def set_portfolio_cash(self, value: str):
+        self.portfolio_cash = value
+        self.portfolio_error = ""
+        self.portfolio_notice = ""
+
+    @rx.event
+    def set_portfolio_currency(self, value: str):
+        self.portfolio_currency = value
+        self.portfolio_error = ""
+        self.portfolio_notice = ""
+
+    @rx.event
+    def set_portfolio_position(self, row_id: str, field: str, value: str):
+        self.portfolio_positions = [
+            {**row, field: value} if row["id"] == row_id else row
+            for row in self.portfolio_positions
+        ]
+        self.portfolio_error = ""
+        self.portfolio_notice = ""
+
+    @rx.event
+    def add_portfolio_position(self):
+        self.portfolio_positions = [
+            *self.portfolio_positions,
+            {"id": str(uuid.uuid4()), "ticker": "", "quantity": "", "average_price": ""},
+        ]
+        self.portfolio_notice = ""
+
+    @rx.event
+    def remove_portfolio_position(self, row_id: str):
+        self.portfolio_positions = [
+            row for row in self.portfolio_positions if row["id"] != row_id
+        ]
+        self.portfolio_error = ""
+        self.portfolio_notice = ""
 
     @rx.event
     def set_filter_ticker(self, value: str):
@@ -400,6 +455,7 @@ class AppState(rx.State):
     def load_new_analysis(self):
         self.selected_run_id = ""
         settings = _repo().get_settings()
+        self._load_saved_portfolio(settings)
         self.llm_provider = str(settings.get("llm_provider", DEFAULT_CONFIG["llm_provider"]))
         self.provider_label = PROVIDER_KEY_TO_LABEL.get(self.llm_provider, self.llm_provider)
         self.backend_url = str(settings.get("backend_url") or provider_metadata(self.llm_provider).backend_url or "")
@@ -430,6 +486,109 @@ class AppState(rx.State):
         self._refresh_model_options()
         self.review_ready = False
         self.form_error = ""
+
+    def _load_saved_portfolio(self, settings: dict[str, Any] | None = None) -> None:
+        """Load the reusable local book into the page draft and run selector."""
+        settings = settings if settings is not None else _repo().get_settings()
+        raw_portfolio = settings.get("portfolio")
+        self.portfolio_error = ""
+        self.portfolio_notice = ""
+        if raw_portfolio is None:
+            self.saved_portfolio = {}
+            self.portfolio_saved = False
+            self.portfolio_status = "No portfolio saved"
+            self.portfolio_cash = ""
+            self.portfolio_currency = ""
+            self.portfolio_positions = []
+            self.use_saved_portfolio = False
+            return
+        try:
+            portfolio = PortfolioContext.model_validate(raw_portfolio)
+        except (TypeError, ValueError) as exc:
+            self.saved_portfolio = {}
+            self.portfolio_saved = False
+            self.portfolio_status = "Saved portfolio is invalid"
+            self.portfolio_cash = ""
+            self.portfolio_currency = ""
+            self.portfolio_positions = []
+            self.use_saved_portfolio = False
+            self.portfolio_error = f"The saved portfolio could not be loaded: {exc}"
+            return
+
+        self.saved_portfolio = portfolio.model_dump(mode="json")
+        self.portfolio_saved = True
+        self.portfolio_cash = "" if portfolio.cash is None else str(portfolio.cash)
+        self.portfolio_currency = portfolio.currency or ""
+        self.portfolio_positions = [
+            {
+                "id": str(uuid.uuid4()),
+                "ticker": position.ticker,
+                "quantity": str(position.quantity),
+                "average_price": ""
+                if position.average_price is None
+                else str(position.average_price),
+            }
+            for position in portfolio.positions
+        ]
+        count = len(portfolio.positions)
+        self.portfolio_status = "Flat book" if count == 0 else f"{count} position{'s' if count != 1 else ''} saved"
+        self.use_saved_portfolio = True
+
+    @rx.event
+    def load_portfolio(self):
+        self.selected_run_id = ""
+        self._load_saved_portfolio()
+
+    @rx.event
+    def save_portfolio(self):
+        positions: list[dict[str, str]] = []
+        for row in self.portfolio_positions:
+            ticker = row.get("ticker", "").strip()
+            quantity = row.get("quantity", "").strip()
+            average_price = row.get("average_price", "").strip()
+            if not ticker and not quantity and not average_price:
+                continue
+            if not ticker or not quantity:
+                self.portfolio_error = "Each position needs both a ticker and a quantity."
+                self.portfolio_notice = ""
+                return
+            position = {"ticker": ticker, "quantity": quantity}
+            if average_price:
+                position["average_price"] = average_price
+            positions.append(position)
+
+        payload: dict[str, Any] = {"positions": positions}
+        if self.portfolio_cash.strip():
+            payload["cash"] = self.portfolio_cash.strip()
+        if self.portfolio_currency.strip():
+            payload["currency"] = self.portfolio_currency.strip()
+        try:
+            portfolio = PortfolioContext.model_validate(payload)
+        except (TypeError, ValueError) as exc:
+            self.portfolio_error = f"Portfolio could not be saved: {exc}"
+            self.portfolio_notice = ""
+            return
+
+        _repo().set_setting("portfolio", portfolio.model_dump(mode="json"))
+        self.saved_portfolio = portfolio.model_dump(mode="json")
+        self.portfolio_saved = True
+        count = len(portfolio.positions)
+        self.portfolio_status = "Flat book" if count == 0 else f"{count} position{'s' if count != 1 else ''} saved"
+        self.portfolio_error = ""
+        self.portfolio_notice = "Portfolio saved. New analyses will use it by default."
+
+    @rx.event
+    def clear_portfolio(self):
+        _repo().delete_setting("portfolio")
+        self.saved_portfolio = {}
+        self.portfolio_saved = False
+        self.portfolio_status = "No portfolio saved"
+        self.portfolio_cash = ""
+        self.portfolio_currency = ""
+        self.portfolio_positions = []
+        self.portfolio_error = ""
+        self.portfolio_notice = "Saved portfolio cleared. New analyses will have no portfolio context."
+        self.use_saved_portfolio = False
 
     def _refresh_model_options(self) -> None:
         quick_labels, _ = _model_labels(self.llm_provider, "quick")
@@ -559,6 +718,7 @@ class AppState(rx.State):
                 "fundamental_data": self.fundamental_vendor,
                 "news_data": self.news_vendor,
             },
+            "portfolio": self.saved_portfolio if self.use_saved_portfolio and self.portfolio_saved else None,
         }
 
     @rx.event
@@ -570,6 +730,13 @@ class AppState(rx.State):
             self.review_ready = False
             return
         self.review_config = request.to_dict()
+        if request.portfolio is None:
+            self.review_portfolio_label = "Not provided — agents will not assume a flat book"
+        elif not request.portfolio.get("positions"):
+            self.review_portfolio_label = "Applied — flat book"
+        else:
+            count = len(request.portfolio["positions"])
+            self.review_portfolio_label = f"Applied — {count} saved position{'s' if count != 1 else ''}"
         self.submission_token = str(uuid.uuid4())
         credential = credential_status(request.llm_provider, load_secrets())
         self.credential_hint = "" if credential["configured"] or not credential["required"] else f"{credential['env']} is required before this run can be queued."
@@ -746,11 +913,18 @@ class AppState(rx.State):
         try:
             from tradingagents.graph.checkpointer import checkpoint_step
             config = run.get("config", {})
+            portfolio_data = config.get("portfolio")
+            portfolio = (
+                PortfolioContext.model_validate(portfolio_data)
+                if portfolio_data is not None
+                else None
+            )
             signature = "|".join([
                 "analysts=" + ",".join(config.get("analysts", [])),
                 f"debate={config.get('max_debate_rounds', 1)}",
                 f"risk={config.get('max_risk_discuss_rounds', 1)}",
                 f"asset={run.get('asset_type', 'stock')}",
+                f"portfolio={portfolio.fingerprint() if portfolio is not None else 'none'}",
             ])
             return checkpoint_step(DEFAULT_CONFIG["data_cache_dir"], run["ticker"], run["trade_date"], signature) is not None
         except Exception:

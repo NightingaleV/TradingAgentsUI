@@ -42,6 +42,7 @@ __all__ = [
     "build_instrument_context",
     "resolve_instrument_identity",
     "get_instrument_context_from_state",
+    "get_portfolio_context_from_state",
     "get_language_instruction",
     "invoke_agent_text",
     "content_filter_warning",
@@ -268,6 +269,23 @@ def get_instrument_context_from_state(state: Mapping[str, Any]) -> str:
     )
 
 
+def get_portfolio_context_from_state(state: Mapping[str, Any]) -> str:
+    """Return a supplied portfolio block without inventing a flat book.
+
+    Portfolio context is intentionally optional. Missing context means the
+    decision agents cannot know the caller's holdings or cash; it must never be
+    described as a zero-position account.
+    """
+    context = state.get("portfolio_context")
+    if isinstance(context, str) and context.strip():
+        return context
+    return (
+        "Portfolio context: not provided. You do not know the caller's current "
+        "holdings or cash, so do not assume a flat book; give direction and "
+        "sizing guidance in terms the caller can apply to their own position."
+    )
+
+
 def create_msg_delete():
     def delete_messages(state):
         """Clear messages and add a context-anchored placeholder.
@@ -293,5 +311,4 @@ def create_msg_delete():
         return {"messages": removal_operations + [placeholder]}
 
     return delete_messages
-
 
