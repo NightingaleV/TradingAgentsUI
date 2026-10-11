@@ -1,0 +1,147 @@
+name: CI
+
+# Forgejo GitHub-Actions-compatible pipeline (runs via act_runner). Mirrors
+# .github/workflows/ci.yml (lint + test matrix + smoke) and additionally proves
+# the shipped Docker image builds and boots cleanly, and that the docker-compose
+# stack composes + initializes (web healthcheck + worker import).
+#
+# Gating model:
+#   * `test`, `build-and-initialize` and `compose` are the MANDATORY lane.
+#     Docker/compose jobs run only after tests pass (via `needs: test`).
+#   * `lint` is informational: it never blocks other jobs. It will only block a
+#     merge if you add it to the branch's required status checks -- don't.
+#
+# Runner requirements:
+#   * one registered act_runner with an `ubuntu-latest` label;
+#   * the docker/compose jobs need a runner with Docker-in-Docker support
+#     (a Forgejo label such as `ubuntu-22.04:docker`); plain runners cannot
+#     reach the Docker daemon.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: ruff (strict, full repo) [optional]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install "ruff>=0.15"
+      - name: Lint the repository
+        # The repo is fully clean under the strict select, so we lint everything
+        # (generated results/ is excluded via pyproject extend-exclude).
+        run: ruff check .
+
+  test:
+    name: tests (py${{ matrix.python-version }}) [required]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run test suite
+        run: pytest -q
+
+  build-and-initialize:
+    name: docker build + boot check [required]
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the Docker image
+        run: docker build -t tradingagents:ci .
+
+      - name: Verify the container initializes and boots
+        # pip extras install + `reflex compile` happen at build time; here we
+        # confirm the app imports, its config loads, and the entrypoint boots
+        # before we stop it.
+        run: |
+          docker run -d --name taci \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            tradingagents:ci tail -f /dev/null
+          trap 'docker rm -f taci >/dev/null 2>&1' EXIT
+
+          echo "==> import check (catches undeclared runtime deps)"
+          docker exec taci python -c \
+            "import tradingagents, cli.main; print('import OK')"
+
+          echo "==> config load check (reflex console initializes)"
+          docker exec taci python -c \
+            "import rxconfig; print('rxconfig OK')"
+
+          echo "==> entrypoint boot check (starts, then we terminate it)"
+          docker exec taci sh -c 'timeout 20 tradingagents --help >/dev/null \
+            && { echo "entrypoint OK"; exit 0; } || { echo "entrypoint exited: $?"; exit 1; }'
+
+      - name: Fresh install smoke (no dev extras)
+        # Belts-and-braces against undeclared base deps from a plain `pip install .`
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          python -c "import tradingagents, cli.main; print('clean-install import OK')"
+
+  compose:
+    name: docker compose up + healthcheck [required]
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provide env_file
+        # docker-compose.yml references `env_file: .env`; compose errors if the
+        # file is absent. Ship an empty one here (defaults are applied via ${VAR:-}).
+        run: touch .env
+
+      - name: Build and start the stack
+        # web runs `reflex run --env prod` with a /_health healthcheck; worker
+        # runs tradingagents.runtime.worker. Whether the web service reaches the
+        # "healthy" state is our success criterion for initialization.
+        run: docker compose up -d --build
+
+      - name: Wait for the web service to become healthy
+        run: |
+          # Resolve the web container by its project label rather than assuming
+          # a fixed name (compose project name follows the checkout dir).
+          WEB="$(docker compose ps -q web)"
+          for i in $(seq 1 30); do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' "$WEB")" = "healthy" ]; then
+              echo "web is healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "web did not become healthy within 150s"
+          docker compose ps
+          docker compose logs --tail=50 web worker
+          exit 1
+
+      - name: Verify the worker process is alive
+        run: |
+          docker compose ps
+          WORKER="$(docker compose ps -q worker)"
+          [ -n "$WORKER" ] && [ "$(docker inspect --format '{{.State.Running}}' "$WORKER")" = "true" ] \
+            && echo "worker container is running" \
+            || { echo "worker is not running"; exit 1; }
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans

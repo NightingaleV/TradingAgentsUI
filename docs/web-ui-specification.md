@@ -52,17 +52,24 @@ The operator can:
 6. Reopen completed runs and download their Markdown report tree, JSON final state, and diagnostic log.
 7. Review the decision memory journal without editing its source file.
 8. Run the CLI and web console against the same persistent Docker volume.
+9. Save one manual portfolio context and decide whether to apply its immutable
+   snapshot to each new analysis.
+10. Explicitly settle mature Memory outcomes and run isolated multi-date
+    decision evaluations without contaminating live lessons.
 
 ### Explicit non-goals for MVP
 
 - No live brokerage, simulated exchange, order routing, or account connectivity.
 - No claim that a rating is financial advice; retain the repository disclaimer.
 - No autonomous scheduling, alerting, watchlists, or recurring scans.
-- No multi-date backtest builder or performance analytics engine.
-- No portfolio positions, P&L ledger, tax lots, or risk limits tied to real holdings.
+- No portfolio simulator, execution model, P&L ledger, or strategy-performance
+  claim. Evaluation measures independent rating outcomes only.
+- No brokerage, position import, P&L ledger, tax lots, valuation, or risk-limit
+  engine. The UI only stores manual holdings context for agent prompts.
 - No concurrent graph execution inside one Python process.
 - No public-internet deployment without an external authenticated TLS reverse proxy.
-- No editing of raw decision-memory entries from the UI.
+- No manual editing of raw decision-memory entries from the UI; the controlled
+  settlement action may atomically record verified outcomes and reflections.
 - No attempt to render or expose hidden chain-of-thought. Only existing messages, tool events, reports, and structured decisions are shown.
 
 ## 3. Repository findings
@@ -190,10 +197,29 @@ Success: a completed analysis is useful without terminal access.
 2. Filters entries by ticker, pending/resolved status, date, or rating.
 3. A resolved entry shows raw return, benchmark alpha, holding window, resolution date, decision, and reflection.
 4. A pending entry explains that the full five-trading-day outcome window has not yet resolved or that data remains unavailable.
+5. Operator selects **Refresh eligible outcomes**, reviews the all-pending
+   ticker count and model, then queues an isolated settlement job.
+6. Mature entries gain raw return, alpha, resolution date, and reflection;
+   unavailable entries remain pending.
 
-Success: the UI is a read-only interpretation of `TradingMemoryLog.load_entries()` and never rewrites the Markdown log.
+Success: the UI never manually edits the log and only writes its existing
+atomic outcome/reflection format through the graph settlement lifecycle.
 
-### Path H — Use Ollama in Compose
+### Path H — Evaluate decisions over time
+
+1. Operator enters comma-separated tickers, a date range, and calendar-day
+   cadence on Evaluation.
+2. UI canonicalizes the assets, requires one asset type, previews the cell
+   count and immutable saved-settings snapshot, and rejects grids over 50 cells.
+3. The durable worker writes all cells into a private evaluation journal,
+   allowing retry/resume without touching live Memory.
+4. The result view shows pending/resolved counts, rating-level hit rate and
+   mean alpha, plus each cell's status and realized outcome.
+
+Success: the result is a decision-quality research record, not a portfolio
+simulation or investment-performance claim.
+
+### Path I — Use Ollama in Compose
 
 1. Operator starts the Compose `ollama` profile and pulls a model separately.
 2. Selects Ollama in New analysis.
@@ -220,12 +246,23 @@ Empty state: explain what an analysis produces and link to Settings/Health.
 
 ### 6.2 New analysis
 
-One form, divided into four visual sections:
+One form, divided into five visual sections:
 
 1. Instrument — ticker, normalized identity/type, as-of date, output language.
-2. Team — selected analysts and depth preset.
-3. Models — provider/region, endpoint where applicable, quick/deep model, reasoning control.
-4. Reliability — checkpoint toggle and collapsed advanced settings.
+2. Portfolio context — optional switch for the saved book; links to the separate Portfolio page for edits.
+3. Team — selected analysts and depth preset.
+4. Models — provider/region, endpoint where applicable, quick/deep model, reasoning control.
+5. Reliability — checkpoint toggle and collapsed advanced settings.
+
+### Portfolio
+
+The Reflex console provides one local reusable portfolio page with optional cash
+and currency plus editable ticker, signed quantity, and optional average-price
+rows. Saving an empty positions list is an explicit flat book; clearing the
+saved book or opting out per run means no context, not a flat book. The Trader,
+Risk Analysts, and Portfolio Manager receive the snapshot; the research team
+does not. The queued run configuration preserves the selected JSON snapshot so
+later edits cannot change an active, retried, or historical analysis.
 
 The form’s submit action is **Review configuration**, not queue. It validates and canonicalizes the draft, derives asset type, removes invalid analyst choices, and shows a final summary. A separate **Queue analysis** button creates the job exactly once using an idempotency token. Streamlit widget changes inside the form must never queue work.
 
@@ -261,12 +298,23 @@ Actions:
 
 ### 6.5 Memory
 
-- Read-only table/detail view from the configured global memory log.
+- Table/detail view from the configured global memory log.
 - Clearly distinguish trade date from outcome resolution date.
 - Explain “raw return” and “alpha vs benchmark.”
 - Preserve `REVIEW`/rating text as stored; do not silently coerce a missing value for display.
+- Provide a review-and-queue control that processes all pending tickers through
+  the existing deferred-reflection lifecycle; it never permits raw Markdown edits.
 
-### 6.6 Settings and Health
+### 6.6 Evaluation
+
+- Accept a comma-separated ticker grid, start/end dates, and cadence; show a
+  review step with a 50-cell cap and the saved configuration snapshot.
+- Persist private per-cell journal/results, progress, failures, cancellation,
+  and resume state in the same single-worker queue as analyses.
+- Show count, direction hit rate, and mean alpha grouped by rating; state that
+  no positions, fills, cash, fees, or P&L are modeled.
+
+### 6.7 Settings and Health
 
 Sections:
 
@@ -787,7 +835,8 @@ Exit: a command can enqueue a run, worker completes it, and a second process can
 
 - Dashboard, New analysis, Run detail, Runs, Settings/Health.
 - Live fragment polling and all report/artifact views.
-- Read-only Memory page if it does not threaten the delivery window; otherwise ship immediately after MVP.
+- Controlled Memory settlement and isolated evaluation jobs after the core
+  queue, with explicit cost/cell guardrails and no live-memory contamination.
 
 Exit: all core user pathways A–F work without terminal interaction after initial Compose startup.
 
